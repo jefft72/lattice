@@ -44,6 +44,12 @@ impl CpuDeltas {
     }
 }
 
+/// Monotonic clocks can exclude suspend. Clock disagreement is a gap, never
+/// proof that sleep occurred. Pure helper keeps the timing rule testable.
+fn cpu_clock_gap(monotonic: Duration, wall: Option<Duration>, maximum: Duration) -> bool {
+    monotonic > maximum || wall.is_none_or(|wall| wall.abs_diff(monotonic) > Duration::from_secs(2))
+}
+
 fn basename(value: &str) -> &str {
     value.rsplit(['/', '\\']).next().unwrap_or(value)
 }
@@ -171,6 +177,8 @@ pub struct LiveSampler {
     current_user: Option<Uid>,
     started: Instant,
     last_system_cpu: Option<Instant>,
+    last_observation: Option<(Instant, SystemTime)>,
+    max_cpu_gap: Duration,
     cpu: CpuDeltas,
     history: HistoryStore,
     attachment: Option<PidAttachment>,
@@ -199,6 +207,8 @@ impl LiveSampler {
             current_user,
             started: Instant::now(),
             last_system_cpu: None,
+            last_observation: None,
+            max_cpu_gap: Duration::from_secs(3),
             cpu: CpuDeltas::default(),
             history: HistoryStore::default(),
             attachment: None,
@@ -213,6 +223,17 @@ impl LiveSampler {
             attachment: Some(PidAttachment::new(pid)),
             ..Self::new()
         }
+    }
+
+    /// A resumed/scope-changed observation primes CPU counters again. Unknown is
+    /// not zero, and the unknown sample is retained in history as a visible gap.
+    pub fn reset_cpu_baseline(&mut self) {
+        self.cpu = CpuDeltas::default();
+        self.last_system_cpu = None;
+    }
+
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.max_cpu_gap = interval.saturating_mul(3).max(Duration::from_secs(3));
     }
 
     pub fn sample(&mut self, all_processes: bool) -> Snapshot {
@@ -275,6 +296,19 @@ impl LiveSampler {
                 attachment.requested_pid(),
             ));
         }
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        if let Some((last, last_wall)) = self.last_observation {
+            let monotonic_delta = now.duration_since(last);
+            if cpu_clock_gap(
+                monotonic_delta,
+                wall.duration_since(last_wall).ok(),
+                self.max_cpu_gap,
+            ) {
+                self.reset_cpu_baseline();
+            }
+        }
+        self.last_observation = Some((now, wall));
         let at = self.started.elapsed();
 
         let runtime_pids: Vec<Pid> = pids
@@ -709,5 +743,69 @@ mod tests {
         assert!(sampler.system.processes().values().all(|p| {
             p.cmd().is_empty() && p.environ().is_empty() && p.cwd().is_none() && p.exe().is_none()
         }));
+    }
+}
+
+#[cfg(test)]
+mod recording_gap_tests {
+    use super::*;
+
+    #[test]
+    fn pause_reset_primes_unknown_cpu_and_history() {
+        let mut sampler = LiveSampler::new();
+        sampler.set_interval(Duration::from_secs(30));
+        assert_eq!(sampler.max_cpu_gap, Duration::from_secs(90));
+        let key = ProcessKey {
+            pid: 7,
+            started: 10,
+        };
+        sampler.cpu.sample(key, Duration::ZERO, 1000);
+        sampler.last_system_cpu = Some(Instant::now());
+        sampler.reset_cpu_baseline();
+        assert!(sampler.last_system_cpu.is_none());
+        assert_eq!(
+            sampler.cpu.sample(key, Duration::from_secs(60), 90000),
+            None
+        );
+        assert_eq!(
+            sampler.cpu.sample(key, Duration::from_secs(61), 91000),
+            Some(100.0)
+        );
+        sampler.reset_cpu_baseline();
+        let snapshot = sampler.sample(true);
+        assert!(snapshot.system.cpu_percent.is_none());
+        assert_eq!(snapshot.system.cpu_history.last(), Some(&None));
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|s| s.cpu_percent().is_none() && s.cpu_history.last() == Some(&None))
+        );
+    }
+
+    #[test]
+    fn delays_and_clock_discontinuities_reprime_without_inventing_sleep() {
+        let max = Duration::from_secs(3);
+        assert!(!cpu_clock_gap(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            max
+        ));
+        assert!(cpu_clock_gap(
+            Duration::from_secs(4),
+            Some(Duration::from_secs(4)),
+            max
+        ));
+        assert!(cpu_clock_gap(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(300)),
+            max
+        ));
+        assert!(cpu_clock_gap(Duration::from_secs(1), None, max));
+        assert!(!cpu_clock_gap(
+            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(90)
+        ));
     }
 }

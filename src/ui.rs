@@ -274,6 +274,39 @@ impl Widget for Dashboard<'_> {
                 );
             }
         }
+        if area.height >= 4 {
+            let text = if let Some(notice) = &app.recording_notice {
+                notice.clone()
+            } else if let Some(recording) = &app.recording_status {
+                format!(
+                    "{}{} · {} · {} · {} samples · R {}",
+                    if recording.demo { "SIM " } else { "" },
+                    if recording.stopped {
+                        "SAVED"
+                    } else if app.paused || app.stale() || app.resuming {
+                        "REC GAP"
+                    } else {
+                        "REC"
+                    },
+                    recording.name,
+                    crate::recording::format_duration(recording.elapsed_secs),
+                    recording.samples,
+                    if recording.stopped { "new" } else { "stop" }
+                )
+            } else {
+                "R start local recording".into()
+            };
+            s.text(
+                x,
+                area.height - 3,
+                text,
+                if app.recording_notice.is_some() {
+                    PEACH
+                } else {
+                    BLUE
+                },
+            );
+        }
         if area.height > 2 {
             let hint = if app.editing_search {
                 "type to filter · enter keep · esc cancel"
@@ -339,6 +372,9 @@ impl Widget for Dashboard<'_> {
         }
         if app.editing_rename.is_some() {
             rename_view(&mut s, app);
+        }
+        if app.editing_recording {
+            recording_view(&mut s, app);
         }
     }
 }
@@ -1489,6 +1525,19 @@ const GUIDE: &[(&str, Color)] = &[
         "q quits except while typing a search or nickname. Ctrl-C always quits. ? or Esc closes this guide.",
         TEXT,
     ),
+    ("LOCAL HACKATHON RECORDING", BLUE),
+    (
+        "Start with ./lattice --record CalHacks, or Shift-R and a name. Shift-R stops and saves. Keep the app open: it is not a daemon and cannot record while closed. Space pauses both sampling and recording, leaving an explicit gap.",
+        TEXT,
+    ),
+    (
+        "By default one observed CPU/RAM sample is saved every 5 seconds, with up to 32 family contributors. Review recorded-sample peaks/means and gaps using recordings list, recordings show FILE, or recordings export FILE --output report.csv. Restart creates a separate file, never resumes silently.",
+        TEXT,
+    ),
+    (
+        "Recording files are local, bounded, and recover complete records after an interrupted write. Demo recordings are labeled simulated and kept separately. Recorded values are snapshots, not total work or energy. Disk errors stop recording visibly, not monitoring.",
+        TEXT,
+    ),
     ("MAKE IT YOUR WORKSPACE", MINT),
     (
         "r names the selected session for this run. Names are bounded, terminal-safe, and tied to PID/start identity, not inherited when the start identity changes. Empty name restores the original. At most 128 names are retained.",
@@ -1562,7 +1611,7 @@ const GUIDE: &[(&str, Color)] = &[
         TEXT,
     ),
     (
-        "No process control, argument display, saved activity logs, or telemetry. The OS backend may read argument buffers transiently on macOS.",
+        "No process control, argument display, or telemetry. Recording is opt-in and writes local metric files. The OS backend may read argument buffers transiently on macOS.",
         MINT,
     ),
     ("START AGAIN", LILAC),
@@ -1677,6 +1726,48 @@ fn signed_bytes(delta: i64) -> String {
         bytes(delta.unsigned_abs())
     )
 }
+fn recording_view(s: &mut Surface<'_>, app: &App) {
+    s.fill(s.area, BG);
+    let width = s.area.width.saturating_sub(4).clamp(1, 78);
+    let height = s.area.height.saturating_sub(2).clamp(1, 16);
+    let r = Rect::new(
+        s.area.width.saturating_sub(width) / 2,
+        s.area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    s.fill(r, PANEL);
+    if width < 10 || height < 5 {
+        return;
+    }
+    s.bold(
+        r.x + 2,
+        r.y,
+        if app.snapshot.demo {
+            "START SIMULATED RECORDING"
+        } else {
+            "START LOCAL RECORDING"
+        },
+        BLUE,
+    );
+    s.bold(r.x + 2, r.y + 2, format!("{}▏", app.recording_name), TEXT);
+    let copy = "Name this run (e.g. CalHacks). Writes CPU/RAM samples and safe family names locally. Keep lattice running: no daemon, no recording while closed. Space pauses sampling and leaves a gap. R stops and saves; restart creates a separate file. No command arguments, paths, or telemetry. Find files after quitting: lattice recordings list.";
+    for (i, line) in wrap_line(copy, width.saturating_sub(4) as usize)
+        .into_iter()
+        .enumerate()
+    {
+        if 4 + (i as u16) < height.saturating_sub(2) {
+            s.text(r.x + 2, r.y + 4 + i as u16, line, DIM);
+        }
+    }
+    s.text(
+        r.x + 2,
+        r.bottom() - 1,
+        "enter start  esc cancel  ^C quit",
+        DIM,
+    );
+}
+
 fn rename_view(s: &mut Surface<'_>, app: &App) {
     s.fill(s.area, BG);
     let Some(key) = app.editing_rename else {

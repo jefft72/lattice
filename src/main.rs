@@ -5,10 +5,11 @@ mod doctor;
 mod explorer;
 mod insights;
 mod model;
+mod recording;
 mod sampling;
 mod ui;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::{
     io::{self, IsTerminal},
     path::PathBuf,
@@ -20,9 +21,21 @@ use std::{
     name = "lattice",
     version,
     about = "Your coding sessions, seen as constellations.",
-    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n  ./lattice --pid 12345  Watch an existing dev server or build family\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: 1–4 or [ ] switch screens · ←/→ previous/next · j/k select · Enter inspect · i inspector · g graph · m RAM/CPU · r nickname · e changes · / search · * pin · s sort · Space pause · ? help · q quit\n\nRead-only. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
+    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n  ./lattice --pid 12345  Watch an existing dev server or build family\n  ./lattice --record CalHacks  Record locally while the app stays open\n  ./lattice recordings list  Find saved recordings\n  ./lattice recordings show FILE  Review peaks, gaps, and contributors\n  ./lattice recordings export FILE --output report.csv  Export samples\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: 1–4 or [ ] switch screens · ←/→ previous/next · j/k select · Enter inspect · i inspector · g graph · m RAM/CPU · r nickname · e changes · / search · * pin · s sort · Space pause · R record/stop · ? help · q quit\n\nProcess monitoring is read-only; recording explicitly writes local files. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
 )]
 struct Args {
+    /// Manage completed or interrupted local recordings without opening the TUI.
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// Start an opt-in local recording, e.g. --record CalHacks. Keep the app open.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["doctor", "snapshot", "tour"])]
+    record: Option<String>,
+    /// Recording storage root; live and simulated files are kept in separate folders.
+    #[arg(long, global = true, value_name = "DIRECTORY")]
+    record_dir: Option<PathBuf>,
+    /// Persist one observed sample every N seconds (1–60); default is low-overhead.
+    #[arg(long, default_value_t = recording::DEFAULT_RECORD_INTERVAL.as_secs(), value_parser = clap::value_parser!(u64).range(1..=60))]
+    record_every: u64,
     /// Explore a deterministic simulation instead of live processes.
     #[arg(long)]
     demo: bool,
@@ -70,6 +83,29 @@ struct Args {
     height: u16,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List, review, or export local recordings. Does not sample processes.
+    Recordings {
+        #[command(subcommand)]
+        command: RecordingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecordingCommand {
+    /// List saved live and simulated recordings in the configured storage root.
+    List,
+    /// Review recorded CPU/RAM peaks, sample means, gaps, and family contributors.
+    Show { file: PathBuf },
+    /// Export time-series and family rows to a new CSV file; never overwrites.
+    Export {
+        file: PathBuf,
+        #[arg(long, short, value_name = "CSV")]
+        output: PathBuf,
+    },
+}
+
 fn parse_interval(value: &str) -> Result<f64, String> {
     let value: f64 = value
         .parse()
@@ -83,6 +119,36 @@ fn parse_interval(value: &str) -> Result<f64, String> {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    if let Some(Command::Recordings { command }) = args.command {
+        if args.record.is_some()
+            || args.demo
+            || args.tour
+            || args.doctor
+            || args.snapshot.is_some()
+            || args.pid.is_some()
+            || args.all
+        {
+            return Err(io::Error::other(
+                "recordings commands cannot be combined with monitoring options",
+            ));
+        }
+        match command {
+            RecordingCommand::List => print!("{}", recording::list(args.record_dir.as_deref())?),
+            RecordingCommand::Show { file } => print!("{}", recording::review(&file)?),
+            RecordingCommand::Export { file, output } => {
+                recording::export_csv(&file, &output)?;
+                println!(
+                    "Exported recording to {}",
+                    output
+                        .to_string_lossy()
+                        .chars()
+                        .flat_map(char::escape_default)
+                        .collect::<String>()
+                );
+            }
+        }
+        return Ok(());
+    }
     if args.doctor {
         return doctor::run();
     }
@@ -131,6 +197,11 @@ fn main() -> io::Result<()> {
         args.tour,
         args.no_motion,
         args.pid,
+        app::RecordingLaunch {
+            name: args.record,
+            directory: args.record_dir,
+            interval: Duration::from_secs(args.record_every),
+        },
     )
 }
 

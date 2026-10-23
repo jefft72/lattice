@@ -3,6 +3,7 @@ use crate::{
     explorer::Explorer,
     insights::{Insights, rss_delta},
     model::{AttachmentStatus, ProcessKey, ProcessSnapshot, SessionSnapshot, Snapshot},
+    recording::{Recorder, RecordingOptions, RecordingStatus},
     sampling::{DemoSampler, LiveSampler},
     ui,
 };
@@ -17,6 +18,7 @@ use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -150,6 +152,10 @@ pub struct App {
     pub hitboxes: Vec<(Rect, ui::HitTarget)>,
     pub last_sample: Instant,
     pub interval: Duration,
+    pub recording_status: Option<RecordingStatus>,
+    pub recording_notice: Option<String>,
+    pub editing_recording: bool,
+    pub recording_name: String,
     pub sampler_failed: bool,
     pub resuming: bool,
 }
@@ -195,6 +201,10 @@ impl App {
             hitboxes: Vec::new(),
             last_sample: Instant::now(),
             interval: Duration::from_secs(1),
+            recording_status: None,
+            recording_notice: None,
+            editing_recording: false,
+            recording_name: String::new(),
             sampler_failed: false,
             resuming: false,
         };
@@ -242,7 +252,11 @@ impl App {
     }
 
     pub fn navigation_blocked(&self) -> bool {
-        self.editing_search || self.editing_rename.is_some() || self.help || self.tour
+        self.editing_search
+            || self.editing_rename.is_some()
+            || self.editing_recording
+            || self.help
+            || self.tour
     }
 
     /// Return true only when a navigation/inspector key was handled. Editors and
@@ -772,6 +786,54 @@ impl App {
     }
 }
 
+pub struct RecordingLaunch {
+    pub name: Option<String>,
+    pub directory: Option<PathBuf>,
+    pub interval: Duration,
+}
+
+fn recording_error(app: &mut App, recorder: &mut Option<Recorder>, error: io::Error) {
+    if let Some(recording) = recorder.take() {
+        let mut status = recording.info();
+        status.stopped = true;
+        app.recording_status = Some(status);
+    }
+    let message: String = error
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(110)
+        .collect();
+    app.recording_notice = Some(format!("RECORDING STOPPED · {message}"));
+}
+
+fn stop_recording(app: &mut App, recorder: &mut Option<Recorder>, reason: &str) {
+    if let Some(mut recording) = recorder.take() {
+        let result = recording.finish(reason);
+        app.recording_status = Some(recording.info());
+        app.recording_notice = Some(match result {
+            Ok(()) => "Recording saved · use recordings list / show / export after quitting".into(),
+            Err(error) => format!(
+                "Recording stopped; final save failed: {}",
+                error
+                    .to_string()
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(80)
+                    .collect::<String>()
+            ),
+        });
+    }
+}
+
+fn recording_gap(app: &mut App, recorder: &mut Option<Recorder>, reason: &str) {
+    if let Some(recording) = recorder.as_mut()
+        && let Err(error) = recording.mark_gap(reason)
+    {
+        recording_error(app, recorder, error);
+    }
+}
+
 struct TerminalGuard {
     signals: Vec<signal_hook::SigId>,
 }
@@ -792,6 +854,7 @@ pub fn run(
     tour: bool,
     no_motion: bool,
     pid: Option<u32>,
+    recording_launch: RecordingLaunch,
 ) -> io::Result<()> {
     // A bounded channel decouples potentially slow process reads from input/rendering.
     let stop = Arc::new(AtomicBool::new(false));
@@ -814,10 +877,20 @@ pub fn run(
     let worker = thread::spawn(move || {
         let mut demo_sampler = demo.then(DemoSampler::new);
         let mut live_sampler = (!demo).then(|| pid.map(LiveSampler::with_pid).unwrap_or_default());
+        if let Some(sampler) = &mut live_sampler {
+            sampler.set_interval(interval);
+        }
+        let mut previous_generation = 0;
         while !worker_stop.load(Ordering::Relaxed) {
             let start = Instant::now();
             let sample_generation = worker_generation.load(Ordering::Acquire);
             if !worker_pause.load(Ordering::Relaxed) {
+                if sample_generation != previous_generation {
+                    if let Some(sampler) = &mut live_sampler {
+                        sampler.reset_cpu_baseline();
+                    }
+                    previous_generation = sample_generation;
+                }
                 let all = worker_all.load(Ordering::Relaxed);
                 let next = match (&mut demo_sampler, &mut live_sampler) {
                     (Some(s), _) => s.sample(all),
@@ -868,6 +941,31 @@ pub fn run(
     app.interval = interval;
     app.tour = tour;
     app.no_motion = no_motion;
+    let mut recorder = if let Some(name) = recording_launch.name {
+        match Recorder::start(
+            RecordingOptions {
+                name,
+                directory: recording_launch.directory.clone(),
+                interval: recording_launch.interval,
+                sampling_interval: app.interval,
+            },
+            &app.snapshot,
+        ) {
+            Ok(recording) => {
+                app.recording_status = Some(recording.info());
+                Some(recording)
+            }
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                for signal in signals {
+                    signal_hook::low_level::unregister(signal);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut terminal = ratatui::init();
     let guard = TerminalGuard { signals };
     execute!(io::stdout(), EnableMouseCapture)?;
@@ -881,7 +979,16 @@ pub fn run(
             match rx.try_recv() {
                 Ok((epoch, next)) => {
                     if !app.paused && epoch == generation.load(Ordering::Acquire) {
+                        if app.stale() {
+                            recording_gap(&mut app, &mut recorder, "sampler_delay");
+                        }
                         app.update(next);
+                        if let Some(recording) = recorder.as_mut() {
+                            match recording.observe(&app.snapshot) {
+                                Ok(()) => app.recording_status = Some(recording.info()),
+                                Err(error) => recording_error(&mut app, &mut recorder, error),
+                            }
+                        }
                         dirty = true;
                     }
                 }
@@ -896,6 +1003,9 @@ pub fn run(
                 || last_draw.elapsed() >= Duration::from_secs(1)
                 || (transitioning && last_draw.elapsed() >= TRANSITION_FRAME_INTERVAL)
             {
+                if let Some(recording) = &recorder {
+                    app.recording_status = Some(recording.info());
+                }
                 terminal.draw(|frame| {
                     app.hitboxes = ui::draw(frame, &app);
                 })?;
@@ -915,6 +1025,51 @@ pub fn run(
                             && key.code == KeyCode::Char('c')
                         {
                             break;
+                        }
+                        if app.editing_recording {
+                            match key.code {
+                                KeyCode::Esc => app.editing_recording = false,
+                                KeyCode::Backspace => {
+                                    app.recording_name.pop();
+                                }
+                                KeyCode::Char(c)
+                                    if (c.is_ascii_alphanumeric()
+                                        || matches!(c, ' ' | '.' | '_' | '-'))
+                                        && app.recording_name.len() < 64 =>
+                                {
+                                    app.recording_name.push(c)
+                                }
+                                KeyCode::Enter if !app.recording_name.trim().is_empty() => {
+                                    app.editing_recording = false;
+                                    if app.paused || app.stale() || app.resuming {
+                                        app.recording_notice = Some(
+                                            "Resume fresh sampling before starting a recording"
+                                                .into(),
+                                        );
+                                    } else {
+                                        match Recorder::start(
+                                            RecordingOptions {
+                                                name: app.recording_name.trim().to_owned(),
+                                                directory: recording_launch.directory.clone(),
+                                                interval: recording_launch.interval,
+                                                sampling_interval: app.interval,
+                                            },
+                                            &app.snapshot,
+                                        ) {
+                                            Ok(recording) => {
+                                                app.recording_status = Some(recording.info());
+                                                app.recording_notice = None;
+                                                recorder = Some(recording);
+                                            }
+                                            Err(error) => {
+                                                recording_error(&mut app, &mut recorder, error)
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
                         }
                         if app.editing_rename.is_some() {
                             app.rename_key(key.code);
@@ -982,6 +1137,18 @@ pub fn run(
                             }
                             KeyCode::Char('/') => app.start_search(),
                             KeyCode::Char('r') => app.start_rename(),
+                            KeyCode::Char('R') => {
+                                if recorder.is_some() {
+                                    stop_recording(&mut app, &mut recorder, "user_stop");
+                                } else if app.paused || app.stale() || app.resuming {
+                                    app.recording_notice = Some(
+                                        "Resume fresh sampling before starting a recording".into(),
+                                    );
+                                } else {
+                                    app.editing_recording = true;
+                                    app.recording_name.clear();
+                                }
+                            }
                             KeyCode::Char('e') => app.open_changes(),
                             KeyCode::Char('*') => app.toggle_pin(),
                             KeyCode::Char('s') => {
@@ -992,6 +1159,7 @@ pub fn run(
                                 }
                             }
                             KeyCode::Char('a') if app.snapshot.attachment.is_none() => {
+                                recording_gap(&mut app, &mut recorder, "scope_change");
                                 app.requested_all = !app.requested_all;
                                 show_all.store(app.requested_all, Ordering::Relaxed);
                                 generation.fetch_add(1, Ordering::AcqRel);
@@ -1001,6 +1169,8 @@ pub fn run(
                                 }
                             }
                             KeyCode::Char(' ') | KeyCode::Char('p') => {
+                                let gap_reason = if app.paused { "resume" } else { "pause" };
+                                recording_gap(&mut app, &mut recorder, gap_reason);
                                 app.paused = !app.paused;
                                 if !app.paused {
                                     app.insights.mark_gap();
@@ -1072,8 +1242,37 @@ pub fn run(
         }
         Ok(())
     })();
+    stop_recording(
+        &mut app,
+        &mut recorder,
+        if outcome.is_ok() {
+            "app_exit"
+        } else {
+            "app_error"
+        },
+    );
     stop.store(true, Ordering::Relaxed);
     drop(guard);
+    if let Some(status) = &app.recording_status {
+        println!(
+            "Recording {}: {}",
+            if status.demo {
+                "(SIMULATED)"
+            } else {
+                "(local)"
+            },
+            status
+                .path
+                .to_string_lossy()
+                .chars()
+                .flat_map(char::escape_default)
+                .collect::<String>()
+        );
+        println!("Review with: lattice recordings show FILE");
+    }
+    if let Some(notice) = &app.recording_notice {
+        println!("{notice}");
+    }
     // Detach if a platform read stalls: terminal restoration must not wait on the sampler.
     if worker.is_finished() {
         let _ = worker.join();
