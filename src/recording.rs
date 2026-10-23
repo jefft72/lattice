@@ -295,7 +295,7 @@ impl Recorder {
         // Monotonic clocks may exclude suspend on some OSes. A disagreement is
         // labeled as a gap/clock change, never attributed to sleep as a certainty.
         let threshold = (self.sampling_interval.as_secs_f64() * 3.0).max(3.0);
-        if delta > threshold || wall_delta > delta + 2.0 || wall_delta < -2.0 {
+        if delta > threshold || wall_delta < 0.0 || (wall_delta - delta).abs() > 2.0 {
             self.mark_gap("sample-gap-or-clock-change")?;
         }
         if snapshot.all_processes != self.last_all {
@@ -1065,6 +1065,67 @@ mod tests {
             .unwrap()
             .write_all(data)
             .unwrap();
+    }
+
+    #[test]
+    fn backward_adjustment_with_advancing_wall_time_marks_gap_and_unknown_cpu() {
+        let temp = Temp::new();
+        let mut options = temp.options("backward-clock");
+        options.sampling_interval = Duration::from_secs(30);
+        let mut recorder = Recorder::start(options, &snapshot(0.0)).unwrap();
+        let mut next = snapshot(30.0);
+        next.timestamp -= 10.0; // monotonic +30s, wall +20s: neither is negative.
+        recorder.observe(&next).unwrap();
+        let path = recorder.info().path;
+        assert!(review(&path).unwrap().contains("Gap markers: 1"));
+        let (reader, _) = open_reader(&path).unwrap();
+        scan_records(reader, |sample| {
+            if sample.sequence == 2 {
+                assert!(sample.gap);
+                assert_eq!(sample.cpu, None);
+                assert!(
+                    sample
+                        .contributors
+                        .iter()
+                        .all(|contributor| contributor.cpu.is_none())
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn clock_disagreement_is_symmetric_with_two_second_tolerance() {
+        for (adjustment, expected_gaps) in [(-10.0, 1), (10.0, 1), (-2.0, 0), (2.0, 0), (0.0, 0)] {
+            let temp = Temp::new();
+            let mut options = temp.options("clock-tolerance");
+            options.sampling_interval = Duration::from_secs(30);
+            let mut recorder = Recorder::start(options, &snapshot(0.0)).unwrap();
+            let mut next = snapshot(30.0);
+            next.timestamp += adjustment;
+            recorder.observe(&next).unwrap();
+            assert!(
+                review(&recorder.info().path)
+                    .unwrap()
+                    .contains(&format!("Gap markers: {expected_gaps}"))
+            );
+        }
+    }
+
+    #[test]
+    fn even_small_negative_wall_delta_matches_sampler_gap_rule() {
+        let temp = Temp::new();
+        let mut recorder = Recorder::start(temp.options("negative-wall"), &snapshot(0.0)).unwrap();
+        let mut next = snapshot(0.5);
+        next.timestamp -= 1.0; // wall -0.5s, monotonic +0.5s, disagreement <2s.
+        recorder.observe(&next).unwrap();
+        assert!(
+            review(&recorder.info().path)
+                .unwrap()
+                .contains("Gap markers: 1")
+        );
+        assert_eq!(recorder.info().samples, 2); // A gap overrides persistence cadence.
     }
 
     #[test]
