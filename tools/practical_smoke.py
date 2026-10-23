@@ -179,7 +179,8 @@ def live_attachment(binary, pump):
         terminal.expect("PID FAMILY")
         screen = terminal.screen()
         assert re.search(r"SESSIONS\s+01\b", screen), screen
-        terminal.expect("3 processes")
+        terminal.expect("PROCS")
+        assert re.search(rf"#{fixture.pids[0]}\s+.*\s3\s*$", screen, re.M), screen
         assert f"#{os.getpid()}" not in screen, "fixture's unrelated parent was included"
         key(terminal, b"\r")
         terminal.expect("PROCESS EXPLORER")
@@ -188,8 +189,9 @@ def live_attachment(binary, pump):
         key(terminal, b"a")
         terminal.read(0.55)  # Cross a refresh, not merely the immediate input frame.
         terminal.expect("PID FAMILY")
+        key(terminal, b"1")  # Overview owns the family count in the view deck.
         assert re.search(r"SESSIONS\s+01\b", terminal.screen())
-        terminal.expect("3 processes")
+        assert re.search(rf"#{fixture.pids[0]}\s+.*\s3\s*$", terminal.screen(), re.M), terminal.screen()
         assert "ALL FAMILIES" not in terminal.screen()
 
         fixture.close()
@@ -200,7 +202,7 @@ def live_attachment(binary, pump):
         terminal.read(0.55)
         terminal.expect("PID UNSEEN")
         screen = terminal.screen()
-        assert re.search(r"SESSIONS\s+00\b", screen), screen
+        assert re.search(r"\b0 families\b", screen), screen
         assert "PID FAMILY" not in screen and "ALL FAMILIES" not in screen
         assert not re.search(r"crashed|killed|out of memory", screen, re.I), screen
         success = True

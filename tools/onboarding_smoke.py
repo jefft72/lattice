@@ -21,17 +21,24 @@ import unicodedata
 
 
 class Terminal:
-    def __init__(self, binary, width, height, tour=True, no_motion=True, interval="30", extra_args=None):
+    def __init__(self, binary, width, height, tour=True, no_motion=True, interval="30", extra_args=None, color=True):
         self.width, self.height = width, height
         self.master, self.slave = pty.openpty()
         self.original = termios.tcgetattr(self.slave)
         self.output = bytearray()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        env = {**os.environ, "TERM": "xterm-256color"}
+        if color:
+            env.pop("NO_COLOR", None)
+            env["COLORTERM"] = "truecolor"
+        else:
+            env["NO_COLOR"] = "1"
+            env.pop("COLORTERM", None)
         self.process = subprocess.Popen(
             [str(binary), *(extra_args if extra_args is not None else ["--tour" if tour else "--demo"]), "--interval", interval,
              *(["--no-motion"] if no_motion else [])],
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
-            env={**os.environ, "TERM": "xterm-256color"},
+            env=env,
         )
         self.read(0.4)
 
@@ -49,8 +56,18 @@ class Terminal:
         self.read(max(seconds, len(key) * 0.09))
         assert self.process.poll() is None, "unexpected exit during input"
 
-    def screen(self):
+    def resize(self, width, height, seconds=0.25):
+        """Resize the same PTY, retaining its output and cleanup evidence."""
+        self.width, self.height = width, height
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        self.process.send_signal(signal.SIGWINCH)  # Only this script's child.
+        self.read(seconds)
+        assert self.process.poll() is None, f"unexpected exit after resize to {width}x{height}"
+
+    def screen(self, backgrounds=False):
         rows = [[" "] * self.width for _ in range(self.height)]
+        colors = [[None] * self.width for _ in range(self.height)] if backgrounds else None
+        background = None
         x = y = index = 0
         text = self.output.decode("utf-8", "replace")
         while index < len(text):
@@ -66,9 +83,27 @@ class Terminal:
                         x = ((nums[1] if len(nums) > 1 else 1) or 1) - 1
                     elif command == "J" and nums[0] in (2, 3):
                         rows = [[" "] * self.width for _ in range(self.height)]
+                        if backgrounds:
+                            colors = [[background] * self.width for _ in range(self.height)]
                     elif command == "K" and 0 <= y < self.height:
                         for column in range(max(0, x), self.width):
                             rows[y][column] = " "
+                            if backgrounds:
+                                colors[y][column] = background
+                    elif command == "m" and backgrounds:
+                        cursor = 0
+                        while cursor < len(nums):
+                            value = nums[cursor]
+                            if value in (0, 49):
+                                background = None
+                            elif 40 <= value <= 47 or 100 <= value <= 107:
+                                background = (value,)
+                            elif value in (38, 48) and cursor + 1 < len(nums):
+                                size = 4 if nums[cursor + 1] == 2 else 2
+                                if value == 48:
+                                    background = tuple(nums[cursor + 1:cursor + size + 1])
+                                cursor += size
+                            cursor += 1
                     elif command == "G":
                         x = count - 1
                     elif command == "C":
@@ -90,9 +125,12 @@ class Terminal:
             elif char >= " ":
                 if 0 <= y < self.height and 0 <= x < self.width:
                     rows[y][x] = char
+                    if backgrounds:
+                        colors[y][x] = background
                 x += 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1
             index += 1
-        return "\n".join("".join(row) for row in rows)
+        screen = "\n".join("".join(row) for row in rows)
+        return (screen, colors) if backgrounds else screen
 
     def expect(self, text):
         screen = self.screen()
@@ -187,7 +225,9 @@ def motion_and_guide_cases(binary):
                 assert match, terminal.screen()
                 marks.add(match.group(1))
                 terminal.read(0.15)
-            assert marks == ({"●"} if static else {"●", "·"}), marks
+            # The v3 status indicator is stable in both modes. Motion belongs to
+            # brief view transitions, not a continuously blinking sample marker.
+            assert marks == {"●"}, marks
             terminal.key(b" ")
             frozen = terminal.screen()
             terminal.read(1.1)
@@ -203,7 +243,7 @@ def motion_and_guide_cases(binary):
             terminal.read(1.1)
             assert terminal.screen() == frozen
             success = True
-            print(f"PASS sample-only indicator, no-motion={static}, pause freeze, reverse scope")
+            print(f"PASS stable sample indicator, no-motion={static}, pause freeze, reverse scope")
         finally:
             terminal.close(success)
     terminal = Terminal(binary, 80, 24)
