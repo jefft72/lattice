@@ -1,4 +1,5 @@
-//! The launcher is exercised only against fake tools; no Rust install is changed.
+//! Fake tools capture the launch contract and can dispatch the real test binary.
+//! No Rust install is changed, and no nested Cargo build is needed.
 #![cfg(unix)]
 
 use std::{
@@ -26,6 +27,7 @@ struct Fixture {
     _isolation: MutexGuard<'static, ()>,
     root: PathBuf,
     project: PathBuf,
+    caller: PathBuf,
     bin: PathBuf,
     home: PathBuf,
     cargo_home: PathBuf,
@@ -67,11 +69,12 @@ impl Fixture {
             root.clone()
         };
         let project = temp_root.join("checkout with spaces");
+        let caller = temp_root.join("caller with spaces");
         let bin = temp_root.join("fake tools");
         let home = temp_root.join("home");
         let cargo_home = home.join(".cargo");
         let rustup_home = home.join(".rustup");
-        for directory in [&project, &bin, &cargo_home, &rustup_home] {
+        for directory in [&project, &caller, &bin, &cargo_home, &rustup_home] {
             fs::create_dir_all(directory).unwrap();
         }
         fs::write(project.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
@@ -104,9 +107,17 @@ if [ "$1" = '--version' ]; then
     exit 0
 fi
 {{
-    printf '%s\n' "$PWD" "$PATH" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" "$#"
-    printf '%s\n' "$@"
+    printf '%s\000' "$PWD" "$PATH" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" "$RUSTUP_AUTO_INSTALL" "$#"
+    printf '%s\000' "$@"
 }} > "$TEST_CAPTURE"
+if [ -n "${{TEST_BINARY:-}}" ]; then
+    while [ "$#" -gt 0 ] && [ "$1" != '--' ]; do
+        shift
+    done
+    [ "$#" -gt 0 ] || exit 99
+    shift
+    exec "$TEST_BINARY" "$@"
+fi
 exit "${{TEST_CARGO_EXIT:-0}}"
 "#
                 ),
@@ -132,6 +143,7 @@ exit "${{TEST_CARGO_EXIT:-0}}"
             capture: temp_root.join("capture"),
             root,
             project,
+            caller,
             bin,
             home,
             cargo_home,
@@ -142,7 +154,7 @@ exit "${{TEST_CARGO_EXIT:-0}}"
     fn command(&self) -> Command {
         let mut command = Command::new(self.project.join("lattice"));
         command
-            .current_dir(&self.root)
+            .current_dir(&self.caller)
             .env_clear()
             .env("PATH", &self.bin)
             .env("HOME", &self.home)
@@ -158,9 +170,45 @@ exit "${{TEST_CARGO_EXIT:-0}}"
     fn captured(&self) -> Vec<String> {
         fs::read_to_string(&self.capture)
             .unwrap()
-            .lines()
+            .strip_suffix('\0')
+            .unwrap()
+            .split('\0')
             .map(str::to_owned)
             .collect()
+    }
+
+    fn assert_cargo_arguments(&self, arguments: &[&str]) {
+        let captured = self.captured();
+        let manifest = self.project.canonicalize().unwrap().join("Cargo.toml");
+        let mut expected = vec![
+            "run",
+            "--locked",
+            "--release",
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+            "--",
+        ];
+        expected.extend_from_slice(arguments);
+        assert_eq!(captured[6], expected.len().to_string());
+        assert_eq!(captured[7..], expected);
+    }
+
+    fn binary(&self) -> Command {
+        let environment = self.command();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lattice"));
+        command.env_clear().current_dir(&self.caller);
+        for (key, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command
+    }
+
+    fn launcher_with_binary(&self) -> Command {
+        let mut command = self.command();
+        command.env("TEST_BINARY", env!("CARGO_BIN_EXE_lattice"));
+        command
     }
 
     fn assert_clean_failure(&self, output: &Output, needle: &str) {
@@ -280,6 +328,7 @@ fn spaces_arguments_and_environment_are_preserved_exactly() {
         "*.svg",
         "$(not-a-command)",
         "--literal=a;b",
+        "line one\nline two.svg",
     ];
     let output = fixture.command().args(arguments).output().unwrap();
     assert!(
@@ -291,16 +340,14 @@ fn spaces_arguments_and_environment_are_preserved_exactly() {
     let captured = fixture.captured();
     assert_eq!(
         Path::new(&captured[0]),
-        fixture.project.canonicalize().unwrap()
+        fixture.caller.canonicalize().unwrap()
     );
     assert_eq!(OsStr::new(&captured[1]), fixture.bin.as_os_str());
     assert_eq!(Path::new(&captured[2]), fixture.home);
     assert_eq!(Path::new(&captured[3]), fixture.cargo_home);
     assert_eq!(Path::new(&captured[4]), fixture.rustup_home);
-    assert_eq!(captured[5], "11");
-    let mut expected = vec!["run", "--locked", "--release", "--"];
-    expected.extend(arguments);
-    assert_eq!(captured[6..], expected);
+    assert_eq!(captured[5], "0");
+    fixture.assert_cargo_arguments(&arguments);
     let mut after = files_below(&fixture.root);
     assert!(after.remove(Path::new("capture")).is_some());
     assert_eq!(
@@ -326,14 +373,17 @@ fn symlinked_temporary_root_is_resolved_without_rewriting_environment() {
         String::from_utf8_lossy(&output.stderr)
     );
     let captured = fixture.captured();
-    assert_eq!(Path::new(&captured[0]), canonical_project);
-    // Only the working directory is physical; caller-provided environment paths
-    // must retain their original spelling, even when they contain a symlink.
+    assert_eq!(
+        Path::new(&captured[0]),
+        fixture.caller.canonicalize().unwrap()
+    );
+    // The manifest identifies the physical checkout, but the working directory
+    // stays the caller's. Environment paths retain their original spelling.
     assert_eq!(OsStr::new(&captured[1]), fixture.bin.as_os_str());
     assert_eq!(Path::new(&captured[2]), fixture.home);
     assert_eq!(Path::new(&captured[3]), fixture.cargo_home);
     assert_eq!(Path::new(&captured[4]), fixture.rustup_home);
-    assert_eq!(captured.last().unwrap(), "--doctor");
+    fixture.assert_cargo_arguments(&["--doctor"]);
 }
 
 #[test]
@@ -381,8 +431,9 @@ fn relative_launcher_path_resolves_its_own_checkout() {
     command = {
         let mut relative = Command::new("/bin/sh");
         relative
-            .current_dir(&fixture.root)
-            .arg("checkout with spaces/lattice");
+            .env_clear()
+            .current_dir(&fixture.caller)
+            .arg("../checkout with spaces/lattice");
         for (key, value) in command.get_envs() {
             if let Some(value) = value {
                 relative.env(key, value);
@@ -393,8 +444,9 @@ fn relative_launcher_path_resolves_its_own_checkout() {
     assert!(command.arg("--help").output().unwrap().status.success());
     assert_eq!(
         Path::new(&fixture.captured()[0]),
-        fixture.project.canonicalize().unwrap()
+        fixture.caller.canonicalize().unwrap()
     );
+    fixture.assert_cargo_arguments(&["--help"]);
 }
 
 #[test]
@@ -411,14 +463,14 @@ fn missing_project_files_fail_before_any_build() {
 }
 
 #[test]
-fn launcher_found_on_path_uses_the_checkout_not_the_callers_directory() {
+fn launcher_found_on_path_uses_its_manifest_but_keeps_the_callers_directory() {
     let fixture = Fixture::new(
         Some("cargo 1.95.0 (fixture)"),
         Some("rustc 1.95.0 (fixture)"),
     );
     let environment = fixture.command();
     let mut command = Command::new("/bin/sh");
-    command.env_clear().current_dir(&fixture.home);
+    command.env_clear().current_dir(&fixture.caller);
     for (key, value) in environment.get_envs() {
         if let Some(value) = value {
             command.env(key, value);
@@ -438,10 +490,106 @@ fn launcher_found_on_path_uses_the_checkout_not_the_callers_directory() {
     let captured = fixture.captured();
     assert_eq!(
         Path::new(&captured[0]),
-        fixture.project.canonicalize().unwrap()
+        fixture.caller.canonicalize().unwrap()
     );
     assert_eq!(OsStr::new(&captured[1]), path);
-    assert_eq!(captured.last().unwrap(), "--doctor");
+    fixture.assert_cargo_arguments(&["--doctor"]);
+}
+
+#[test]
+fn callers_manifest_cannot_replace_the_launchers_manifest() {
+    let fixture = Fixture::new(
+        Some("cargo 1.95.0 (fixture)"),
+        Some("rustc 1.95.0 (fixture)"),
+    );
+    fs::write(fixture.caller.join("Cargo.toml"), "not this project\n").unwrap();
+    fs::write(fixture.caller.join("Cargo.lock"), "not this lockfile\n").unwrap();
+    assert!(
+        fixture
+            .command()
+            .arg("--doctor")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fixture.assert_cargo_arguments(&["--doctor"]);
+
+    fs::remove_file(fixture.project.join("Cargo.toml")).unwrap();
+    fs::remove_file(&fixture.capture).unwrap();
+    fixture.assert_clean_failure(
+        &fixture.command().output().unwrap(),
+        "Keep lattice beside Cargo.toml and Cargo.lock",
+    );
+}
+
+#[test]
+fn relative_snapshot_matches_the_direct_binary_from_another_directory() {
+    let fixture = Fixture::new(
+        Some("cargo 1.95.0 (fixture)"),
+        Some("rustc 1.95.0 (fixture)"),
+    );
+    let relative = "exports with spaces/snapshot.svg";
+    fs::create_dir(fixture.caller.join("exports with spaces")).unwrap();
+    let arguments = [
+        "--demo",
+        "--snapshot",
+        relative,
+        "--width",
+        "80",
+        "--height",
+        "24",
+    ];
+    let direct = fixture.binary().args(arguments).output().unwrap();
+    assert!(
+        direct.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let expected = fs::read(fixture.caller.join(relative)).unwrap();
+    fs::remove_file(fixture.caller.join(relative)).unwrap();
+
+    let launched = fixture
+        .launcher_with_binary()
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    assert_eq!(launched.status.code(), direct.status.code());
+    assert_eq!(launched.stdout, direct.stdout);
+    assert_eq!(launched.stderr, direct.stderr);
+    assert_eq!(fs::read(fixture.caller.join(relative)).unwrap(), expected);
+    assert!(!fixture.project.join("exports with spaces").exists());
+    fixture.assert_cargo_arguments(&arguments);
+}
+
+#[test]
+fn relative_snapshot_failure_matches_the_direct_binary() {
+    let fixture = Fixture::new(
+        Some("cargo 1.95.0 (fixture)"),
+        Some("rustc 1.95.0 (fixture)"),
+    );
+    // A directory with the destination's name makes writing fail in the caller,
+    // even though the same relative destination is writable in the checkout.
+    let relative = "destination with spaces.svg";
+    fs::create_dir(fixture.caller.join(relative)).unwrap();
+    let arguments = ["--demo", "--snapshot", relative];
+    let direct = fixture.binary().args(arguments).output().unwrap();
+    let launched = fixture
+        .launcher_with_binary()
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(!direct.status.success());
+    assert_eq!(launched.status.code(), direct.status.code());
+    assert_eq!(launched.stdout, direct.stdout);
+    assert_eq!(launched.stderr, direct.stderr);
+    assert!(!fixture.project.join(relative).exists());
+    fixture.assert_cargo_arguments(&arguments);
 }
 
 #[test]
