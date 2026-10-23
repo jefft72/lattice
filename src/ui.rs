@@ -1266,14 +1266,13 @@ fn trace_chart(
     }
     let plot_y = area.y + if area.height >= 5 { 2 } else { 1 };
     let plot_h = area.bottom() - plot_y;
-    for x in 0..area.width {
-        s.text(area.x + x, area.bottom() - 1, "▁", FAINT);
-    }
     if values.is_empty() {
         return;
     }
     // Expand sample steps to the available width without interpolating values
-    // or implying a wall-clock time axis. Unknown samples remain blank.
+    // or implying a wall-clock time axis. Only measured values get a glyph:
+    // unknown samples stay blank, while measured zero still gets a minimum bar
+    // so the distinction survives terminals with color disabled.
     for column in 0..area.width {
         let index = column as usize * values.len() / area.width as usize;
         let Some(value) = values[index] else {
@@ -2948,6 +2947,71 @@ mod modular_view_tests {
     }
 
     #[test]
+    fn trace_chart_gaps_and_zero_have_distinct_glyphs_without_color() {
+        for (width, height) in [(4, 2), (12, 4), (8, 5), (16, 8)] {
+            let bounds = Rect::new(0, 0, width + 4, height + 2);
+            let chart = Rect::new(2, 1, width, height);
+            let mut buffer = Buffer::empty(bounds);
+            trace_chart(
+                &mut Surface {
+                    buf: &mut buffer,
+                    area: bounds,
+                },
+                chart,
+                "CPU",
+                &[None, Some(0.0), Some(100.0), None],
+                0.0,
+                100.0,
+                LILAC,
+            );
+            let plot_y = chart.y + if height >= 5 { 2 } else { 1 };
+            for column in 0..width {
+                let sample = column * 4 / width;
+                for y in plot_y..chart.bottom() {
+                    let expected = match sample {
+                        1 if y == chart.bottom() - 1 => "▁",
+                        2 => "█",
+                        _ => " ",
+                    };
+                    // Assert symbols, not styles: NO_COLOR removes the tint.
+                    assert_eq!(
+                        buffer[(chart.x + column, y)].symbol(),
+                        expected,
+                        "{width}x{height}, sample {sample}, column {column}, row {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_chart_without_measurements_has_no_zero_baseline() {
+        for values in [vec![], vec![None], vec![None; 4]] {
+            for height in [2, 4, 5, 8] {
+                let area = Rect::new(0, 0, 12, height);
+                let mut buffer = Buffer::empty(area);
+                trace_chart(
+                    &mut Surface {
+                        buf: &mut buffer,
+                        area,
+                    },
+                    area,
+                    "CPU",
+                    &values,
+                    0.0,
+                    100.0,
+                    LILAC,
+                );
+                for y in 1..height {
+                    for x in 0..area.width {
+                        assert_eq!(buffer[(x, y)].symbol(), " ");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn history_cpu_unknowns_are_not_drawn_as_measured_zero() {
         let mut app = App::new(DemoSampler::new().sample(false));
         app.no_motion = true;
@@ -2965,6 +3029,34 @@ mod modular_view_tests {
         assert!(text.contains("blank = unknown"));
         assert!(text.contains("Sample order, not a time axis"));
         assert!(text.contains("no disk log"));
+
+        for (width, height) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            let mut render_history = |values| {
+                app.snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.key == key)
+                    .unwrap()
+                    .cpu_history = values;
+                render(&app, width, height).0
+            };
+            let unknown = render_history(vec![None; 4]);
+            let zero = render_history(vec![Some(0.0); 4]);
+            // The helper returns only glyphs, so color cannot hide a regression.
+            assert_ne!(
+                unknown, zero,
+                "{width}x{height}: unknown must not look idle"
+            );
+            let invalid = render_history(
+                [f32::NAN, f32::INFINITY, -1.0, f32::NEG_INFINITY]
+                    .map(Some)
+                    .to_vec(),
+            );
+            assert_eq!(invalid, unknown, "invalid readings must remain gaps");
+            assert!(unknown.contains("blank = unknown"));
+            assert!(!unknown.contains('▁'));
+            assert!(zero.contains('▁'));
+        }
     }
 }
 
