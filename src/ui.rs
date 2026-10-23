@@ -22,6 +22,7 @@ const TEXT: Color = Color::Rgb(226, 233, 242);
 const DIM: Color = Color::Rgb(119, 139, 161);
 const FAINT: Color = Color::Rgb(49, 65, 85);
 const MINT: Color = Color::Rgb(142, 232, 193);
+const CYAN: Color = Color::Rgb(105, 219, 244);
 const LILAC: Color = Color::Rgb(183, 165, 247);
 const BLUE: Color = Color::Rgb(127, 196, 240);
 const PEACH: Color = Color::Rgb(248, 185, 139);
@@ -124,7 +125,7 @@ impl Widget for Dashboard<'_> {
             3
         };
         let top = if small { 0 } else { 1 };
-        s.bold(x, top, "◈ lattice", MINT);
+        s.bold(x, top, "◈ lattice", CYAN);
         let mode = if app.resuming {
             "SYNCING"
         } else if app.stale() {
@@ -181,7 +182,7 @@ impl Widget for Dashboard<'_> {
                     Rect::new(tab_x.saturating_sub(1), tabs_y, width + 2, 1),
                     SELECT,
                 );
-                s.bold(tab_x, tabs_y, &text, MINT);
+                s.bold(tab_x, tabs_y, &text, CYAN);
             } else {
                 s.text(tab_x, tabs_y, &text, DIM);
             }
@@ -268,7 +269,7 @@ impl Widget for Dashboard<'_> {
                     if app.snapshot.demo {
                         "SIMULATED DATA · nothing on your machine is being measured"
                     } else {
-                        "LOCAL · READ ONLY"
+                        "LOCAL · NO PROCESS CONTROL"
                     },
                     FAINT,
                 );
@@ -278,21 +279,25 @@ impl Widget for Dashboard<'_> {
             let text = if let Some(notice) = &app.recording_notice {
                 notice.clone()
             } else if let Some(recording) = &app.recording_status {
-                format!(
-                    "{}{} · {} · {} · {} samples · R {}",
-                    if recording.demo { "SIM " } else { "" },
-                    if recording.stopped {
-                        "SAVED"
-                    } else if app.paused || app.stale() || app.resuming {
-                        "REC GAP"
-                    } else {
-                        "REC"
-                    },
-                    recording.name,
-                    crate::recording::format_duration(recording.elapsed_secs),
-                    recording.samples,
-                    if recording.stopped { "new" } else { "stop" }
-                )
+                let state = if recording.stopped {
+                    "SAVED"
+                } else if app.paused || app.stale() || app.resuming {
+                    "REC GAP"
+                } else {
+                    "REC"
+                };
+                let mode = if recording.demo { "SIM " } else { "" };
+                let action = if recording.stopped { "new" } else { "stop" };
+                let duration = crate::recording::format_duration(recording.elapsed_secs);
+                // Keep the stop control before an optional long name at every width.
+                if area.width < 80 {
+                    format!("{mode}{state} {duration} · R {action} · {}", recording.name)
+                } else {
+                    format!(
+                        "{mode}{state} · {duration} · R {action} · {} · {} samples",
+                        recording.name, recording.samples
+                    )
+                }
             } else {
                 "R start local recording".into()
             };
@@ -451,18 +456,226 @@ fn session_identity(s: &mut Surface<'_>, app: &App, area: Rect) {
     }
 }
 
+// A sample-driven sweep is a receipt for an observed sample, not a second clock.
+// It never schedules frames or advances when readings are held or unavailable.
+fn core_sweep(app: &App) -> Option<usize> {
+    (!app.no_motion && !app.paused && !app.stale() && !app.resuming)
+        .then_some(app.sample_tick as usize % 72)
+}
+
+fn centered(s: &mut Surface<'_>, center: u16, y: u16, value: &str, tint: Color) {
+    s.bold(
+        center.saturating_sub(value.chars().count() as u16 / 2),
+        y,
+        value,
+        tint,
+    );
+}
+
+fn meter(s: &mut Surface<'_>, x: u16, y: u16, width: u16, value: Option<f64>, tint: Color) {
+    let filled = value.map(|value| (value.clamp(0.0, 100.0) / 100.0 * width as f64).round() as u16);
+    for column in 0..width {
+        let active = filled.is_some_and(|filled| column < filled);
+        s.text(
+            x + column,
+            y,
+            if active { "━" } else { "─" },
+            if active { tint } else { LINE },
+        );
+    }
+}
+
+fn headroom_tint(app: &App) -> Color {
+    if app.paused || app.stale() || app.resuming {
+        return DIM;
+    }
+    match app.insights.headroom().level {
+        HeadroomLevel::Critical => RED,
+        HeadroomLevel::Warning => PEACH,
+        HeadroomLevel::Unknown => DIM,
+        HeadroomLevel::Healthy => CYAN,
+    }
+}
+
+fn headroom_core(s: &mut Surface<'_>, app: &App, center: u16, y: u16) {
+    let tint = headroom_tint(app);
+    let available = app.insights.headroom().available_percent;
+    let sweep = core_sweep(app);
+    centered(s, center, y, "MEMORY HEADROOM", DIM);
+    let cy = y + 6;
+    // A fixed 72-segment arc encodes available memory. The inner contour is
+    // static; only the small outer sample marker moves with an accepted sample.
+    for segment in 0..72 {
+        let angle = segment as f64 / 72.0 * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
+        let x = (center as f64 + angle.cos() * 17.0).round() as u16;
+        let yy = (cy as f64 + angle.sin() * 5.0).round() as u16;
+        let active = available.is_some_and(|percent| segment as f64 / 72.0 < percent / 100.0);
+        s.text(x, yy, "•", if active { tint } else { LINE });
+        if sweep == Some(segment) {
+            let x = (center as f64 + angle.cos() * 19.0).round() as u16;
+            let yy = (cy as f64 + angle.sin() * 5.5).round() as u16;
+            s.text(x, yy, "◆", CYAN);
+        }
+    }
+    s.text(center - 8, cy - 3, "╭───────────────╮", LINE);
+    s.text(center - 8, cy + 3, "╰───────────────╯", LINE);
+    if let Some(percent) = available {
+        const DIGITS: [[&str; 3]; 10] = [
+            ["█▀█", "█ █", "█▄█"],
+            [" ▄█", "  █", "  █"],
+            ["▀▀█", "█▀▀", "█▄▄"],
+            ["▀▀█", " ▀█", "▄▄█"],
+            ["█ █", "▀▀█", "  █"],
+            ["█▀▀", "▀▀█", "▄▄█"],
+            ["█▀▀", "█▀█", "█▄█"],
+            ["▀▀█", "  █", "  █"],
+            ["█▀█", "█▀█", "█▄█"],
+            ["█▀█", "▀▀█", "▄▄█"],
+        ];
+        let number = format!("{percent:.0}");
+        let x = center.saturating_sub((number.len() as u16 * 4 - 1) / 2);
+        for (column, digit) in number.bytes().enumerate() {
+            for row in 0..3 {
+                s.text(
+                    x + column as u16 * 4,
+                    cy - 1 + row,
+                    DIGITS[(digit - b'0') as usize][row as usize],
+                    tint,
+                );
+            }
+        }
+        centered(s, center, cy + 4, &format!("{percent:.0}% AVAILABLE"), DIM);
+    } else {
+        centered(s, center, cy, "unavailable", DIM);
+    }
+    let state = if app.resuming {
+        "SYNCING · last reading"
+    } else if app.stale() {
+        "STALE · last reading"
+    } else if app.paused {
+        "PAUSED · held reading"
+    } else {
+        match app.insights.headroom().level {
+            HeadroomLevel::Critical => "VERY LOW HEADROOM",
+            HeadroomLevel::Warning => "LOW HEADROOM",
+            HeadroomLevel::Unknown => "availability unknown",
+            HeadroomLevel::Healthy => "HEADROOM AVAILABLE",
+        }
+    };
+    centered(s, center, y + 13, state, tint);
+}
+
+fn overview_telemetry(s: &mut Surface<'_>, app: &App, area: Rect) {
+    let system = &app.snapshot.system;
+    let side = (area.width / 3).saturating_sub(6).min(32);
+    let left = area.x + 1;
+    let right = area.right() - side - 1;
+    let compact = area.height < 30;
+    let y = area.y + if compact { 3 } else { 4 };
+    let available = (system.memory_total > 0).then_some(100.0 - system.memory_percent());
+    let tint = headroom_tint(app);
+    headroom_core(
+        s,
+        app,
+        area.x + area.width / 2,
+        area.y + if compact { 1 } else { 2 },
+    );
+
+    s.text(left, y, "MEMORY AVAILABLE", DIM);
+    s.bold(
+        left,
+        y + 2,
+        if system.memory_total == 0 {
+            "unavailable".into()
+        } else {
+            bytes(system.memory_available)
+        },
+        tint,
+    );
+    meter(s, left, y + 4, side, available, tint);
+    s.text(
+        left,
+        y + 6,
+        format!(
+            "{} total · {} used",
+            bytes(system.memory_total),
+            bytes(system.memory_used())
+        )
+        .chars()
+        .take(side as usize)
+        .collect::<String>(),
+        DIM,
+    );
+    s.text(left, y + 9, "SCOPE TOTAL · RSS", DIM);
+    let rss = app
+        .snapshot
+        .sessions
+        .iter()
+        .fold(0u64, |sum, session| sum.saturating_add(session.rss_bytes()));
+    s.bold(left, y + 10, bytes(rss), TEXT);
+    s.text(
+        left,
+        y + 11,
+        format!("{} families · unfiltered", app.snapshot.sessions.len()),
+        DIM,
+    );
+
+    s.text(right, y, "SYSTEM CPU", DIM);
+    s.bold(right, y + 2, cpu(system.cpu_percent), CYAN);
+    meter(
+        s,
+        right,
+        y + 4,
+        side,
+        system.cpu_percent.map(f64::from),
+        CYAN,
+    );
+    s.text(
+        right,
+        y + 6,
+        format!("{} logical cores · 0–100%", system.cpu_count),
+        DIM,
+    );
+    s.text(right, y + 9, "SWAP IN USE", DIM);
+    s.bold(right, y + 10, bytes(system.swap_used), TEXT);
+    s.text(
+        right,
+        y + 11,
+        format!("{} total", bytes(system.swap_total)),
+        DIM,
+    );
+    let note = "Available-memory heuristic · not native OS pressure";
+    centered(
+        s,
+        area.x + area.width / 2,
+        area.y + if compact { 15 } else { 17 },
+        note,
+        DIM,
+    );
+    s.rule(area.x, area.y + if compact { 16 } else { 18 }, area.width);
+}
+
 fn overview(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, HitTarget)>) {
-    title(s, area, "Overview", "The essentials. One family at a time.");
+    title(
+        s,
+        area,
+        "Overview",
+        "SYSTEM TELEMETRY  /  LOCAL OBSERVATIONS",
+    );
     let roomy = area.width >= 66 && area.height >= 12;
     let system = &app.snapshot.system;
-    let list_y = if roomy {
+    let core_layout = area.width >= 104 && area.height >= 25;
+    let list_y = if core_layout {
+        overview_telemetry(s, app, area);
+        area.y + if area.height < 30 { 17 } else { 19 }
+    } else if roomy {
         let col = area.width / 3;
         let level = app.insights.headroom().level;
         let headroom = match level {
             HeadroomLevel::Critical => RED,
             HeadroomLevel::Warning => PEACH,
             HeadroomLevel::Unknown => DIM,
-            HeadroomLevel::Healthy => MINT,
+            HeadroomLevel::Healthy => CYAN,
         };
         for (i, label, value, tint, note) in [
             (
@@ -488,7 +701,7 @@ fn overview(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect
                 1,
                 "SYSTEM CPU",
                 cpu(system.cpu_percent),
-                LILAC,
+                CYAN,
                 format!("{} logical cores", system.cpu_count),
             ),
             (
@@ -587,7 +800,9 @@ fn overview(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect
         );
     }
     let start_y = list_y + u16::from(wide) * 2;
-    let row_h = if roomy && area.height >= 24 {
+    let row_h = if core_layout && area.height < 30 {
+        2
+    } else if roomy && area.height >= 24 {
         3
     } else if roomy {
         2
@@ -1578,7 +1793,11 @@ const GUIDE: &[(&str, Color)] = &[
         TEXT,
     ),
     (
-        "View transitions last 160ms and stop. --no-motion switches instantly. The status dot stays still. Sampling does not speed up during navigation. Trackpad gestures depend on terminal support.",
+        "View transitions last 160ms and stop. --no-motion switches instantly and disables the Overview sample marker. The status dot stays still. Sampling does not speed up during navigation. Trackpad gestures depend on terminal support.",
+        TEXT,
+    ),
+    (
+        "The Overview arc shows available-memory percentage. Its outer marker steps with an accepted sample, not clock time. Paused, stale, and syncing readings are held and labeled. Headroom is a heuristic, not native OS pressure.",
         TEXT,
     ),
     (
@@ -1738,6 +1957,7 @@ fn recording_view(s: &mut Surface<'_>, app: &App) {
     );
     s.fill(r, PANEL);
     if width < 10 || height < 5 {
+        s.text(0, 0, "^C quit", DIM);
         return;
     }
     s.bold(
@@ -1750,8 +1970,9 @@ fn recording_view(s: &mut Surface<'_>, app: &App) {
         },
         BLUE,
     );
+    s.text(r.x + 2, r.y + 1, "Name this run (e.g. CalHacks)", DIM);
     s.bold(r.x + 2, r.y + 2, format!("{}▏", app.recording_name), TEXT);
-    let copy = "Name this run (e.g. CalHacks). Writes CPU/RAM samples and safe family names locally. Keep lattice running: no daemon, no recording while closed. Space pauses sampling and leaves a gap. R stops and saves; restart creates a separate file. No command arguments, paths, or telemetry. Find files after quitting: lattice recordings list.";
+    let copy = "Local CPU/RAM samples + safe family names. Keep lattice open; no daemon or recording while closed. Space leaves a gap. R stops and saves. No args, paths, or telemetry. Review later: lattice recordings list.";
     for (i, line) in wrap_line(copy, width.saturating_sub(4) as usize)
         .into_iter()
         .enumerate()
@@ -2745,5 +2966,242 @@ mod modular_view_tests {
         assert!(text.contains("blank = unknown"));
         assert!(text.contains("Sample order, not a time axis"));
         assert!(text.contains("no disk log"));
+    }
+}
+
+#[cfg(test)]
+mod command_dashboard_tests {
+    use super::*;
+    use crate::sampling::DemoSampler;
+    use std::time::{Duration, Instant};
+
+    fn core(app: &App) -> Buffer {
+        let area = Rect::new(0, 0, 48, 18);
+        let mut buffer = Buffer::empty(area);
+        let mut surface = Surface {
+            buf: &mut buffer,
+            area,
+        };
+        headroom_core(&mut surface, app, 24, 1);
+        buffer
+    }
+
+    #[test]
+    fn sample_sweep_is_observation_driven_and_never_a_second_clock() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.sample_tick = 0;
+        assert_eq!(core_sweep(&app), Some(0));
+        let first = core(&app);
+        assert_eq!(
+            first,
+            core(&app),
+            "repainting the same snapshot must not advance the core"
+        );
+        app.sample_tick = 18;
+        assert_eq!(core_sweep(&app), Some(18));
+        assert_ne!(first, core(&app));
+    }
+
+    #[test]
+    fn reduced_motion_pause_sync_and_stale_disable_the_sweep() {
+        for mode in 0..4 {
+            let mut app = App::new(DemoSampler::new().sample(false));
+            match mode {
+                0 => app.no_motion = true,
+                1 => app.paused = true,
+                2 => app.resuming = true,
+                _ => app.last_sample = Instant::now() - Duration::from_secs(30),
+            }
+            app.sample_tick = 3;
+            assert_eq!(core_sweep(&app), None);
+            let first = core(&app);
+            app.sample_tick = 49;
+            assert_eq!(first, core(&app));
+        }
+    }
+
+    #[test]
+    fn held_core_replaces_reassurance_with_explicit_status() {
+        for (mode, expected) in [
+            (0, "PAUSED · held reading"),
+            (1, "STALE · last reading"),
+            (2, "SYNCING · last reading"),
+        ] {
+            let mut app = App::new(DemoSampler::new().sample(false));
+            match mode {
+                0 => app.paused = true,
+                1 => app.last_sample = Instant::now() - Duration::from_secs(30),
+                _ => app.resuming = true,
+            }
+            let buffer = core(&app);
+            let text = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains(expected));
+            assert!(!text.contains("HEADROOM AVAILABLE"));
+        }
+    }
+
+    #[test]
+    fn unavailable_or_stale_headroom_never_looks_healthy() {
+        let mut snapshot = DemoSampler::new().sample(false);
+        snapshot.system.memory_total = 0;
+        let mut app = App::new(snapshot);
+        let text = |buffer: Buffer| {
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let rendered = text(core(&app));
+        assert!(rendered.contains("unavailable"));
+        assert!(!rendered.contains("HEADROOM AVAILABLE"));
+        app.last_sample = Instant::now() - Duration::from_secs(30);
+        assert!(text(core(&app)).contains("STALE · last reading"));
+        assert_eq!(headroom_tint(&app), DIM);
+    }
+
+    #[test]
+    fn shorter_wide_terminal_keeps_core_and_three_families_visible() {
+        let app = App::new(DemoSampler::new().sample(false));
+        let area = Rect::new(0, 0, 120, 36);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = Vec::new();
+        Dashboard {
+            app: &app,
+            hitboxes: &mut hits,
+        }
+        .render(area, &mut buffer);
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, target)| matches!(target, HitTarget::Session(_)))
+                .count(),
+            3
+        );
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("MEMORY HEADROOM"));
+        assert!(text.contains("not native OS pressure"));
+    }
+
+    #[test]
+    fn standard_dashboard_keeps_all_four_demo_families_visible() {
+        let app = App::new(DemoSampler::new().sample(false));
+        let area = Rect::new(0, 0, 144, 44);
+        let mut buffer = Buffer::empty(area);
+        let mut hits = Vec::new();
+        Dashboard {
+            app: &app,
+            hitboxes: &mut hits,
+        }
+        .render(area, &mut buffer);
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, target)| matches!(target, HitTarget::Session(_)))
+                .count(),
+            4
+        );
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for label in [
+            "MEMORY HEADROOM",
+            "SCOPE TOTAL",
+            "SYSTEM CPU",
+            "SWAP IN USE",
+            "not native OS pressure",
+        ] {
+            assert!(text.contains(label), "{label}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_dashboard_tests {
+    use super::*;
+    use crate::{recording::RecordingStatus, sampling::DemoSampler};
+
+    fn render(app: &App, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        Dashboard {
+            app,
+            hitboxes: &mut Vec::new(),
+        }
+        .render(area, &mut buffer);
+        buffer
+            .content
+            .chunks(width as usize)
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn long_recording_name_cannot_hide_stop_or_simulation_label() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.recording_status = Some(RecordingStatus {
+            name: "A long hackathon recording name for this run".into(),
+            path: "/unused".into(),
+            samples: 123456,
+            elapsed_secs: 172800.0,
+            bytes_written: 1024,
+            demo: true,
+            stopped: false,
+        });
+        for (width, height) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            let text = render(&app, width, height);
+            assert!(text.contains("SIM REC"), "{width}x{height}: {text}");
+            assert!(text.contains("48:00:00"), "{width}x{height}: {text}");
+            assert!(text.contains("R stop"), "{width}x{height}: {text}");
+            assert!(!text.contains("/unused"));
+            app.paused = true;
+            assert!(render(&app, width, height).contains("REC GAP"));
+            app.paused = false;
+        }
+    }
+
+    #[test]
+    fn recording_modal_explains_local_scope_and_limitations_at_compact_size() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.editing_recording = true;
+        app.recording_name = "CalHacks".into();
+        for (width, height) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            let text = render(&app, width, height);
+            let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            for expected in [
+                "START SIMULATED RECORDING",
+                "CalHacks",
+                "Local CPU/RAM",
+                "no daemon",
+                "recording while closed",
+                "Space leaves a gap",
+                "R stops and saves",
+                "No args, paths, or telemetry",
+                "lattice recordings list",
+                "enter start",
+                "esc cancel",
+                "^C quit",
+            ] {
+                assert!(
+                    words.contains(expected),
+                    "{width}x{height}: {expected}\n{text}"
+                );
+            }
+        }
+        for (width, height) in [(1, 1), (7, 3), (20, 6), (30, 12)] {
+            let text = render(&app, width, height);
+            if width >= 7 && height < 7 {
+                assert!(text.contains("^C quit"));
+            }
+        }
     }
 }

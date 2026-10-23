@@ -45,7 +45,7 @@ struct Args {
     /// Check platform, terminal, and sampling without a TTY or saved report.
     #[arg(long, conflicts_with_all = ["demo", "tour", "snapshot", "all"])]
     doctor: bool,
-    /// Disable screen transitions; sampling and readings remain identical.
+    /// Disable screen transitions and sample-driven accents; readings remain identical.
     #[arg(long)]
     no_motion: bool,
     /// Include other process families owned by your OS user.
@@ -158,7 +158,8 @@ fn main() -> io::Result<()> {
         for _ in 0..59 {
             app.update(sampler.sample(args.all));
         }
-        app.no_motion = args.no_motion;
+        // Snapshots freeze decorative sample accents as well as transitions.
+        app.no_motion = true;
         if let Some(view) = args.view {
             app.set_view(view);
         }
