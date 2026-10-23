@@ -38,8 +38,7 @@ case "$launcher_dir" in
     *) launcher_dir=./$launcher_dir ;;
 esac
 project_dir=$(CDPATH= cd -P "$launcher_dir" && pwd -P) || fail 'Cannot open the launcher directory.'
-cd "$project_dir" || fail 'Cannot open the project directory.'
-if [ ! -f Cargo.toml ] || [ ! -f Cargo.lock ]; then
+if [ ! -f "$project_dir/Cargo.toml" ] || [ ! -f "$project_dir/Cargo.lock" ]; then
     fail 'Keep lattice beside Cargo.toml and Cargo.lock in the lattice checkout.'
 fi
 
@@ -71,5 +70,6 @@ require_toolchain() {
 require_toolchain cargo
 require_toolchain rustc
 
+# Keep the caller's working directory so application paths stay caller-relative.
 # exec preserves signals and exit status; -- keeps application arguments separate.
-exec cargo run --locked --release -- "$@"
+exec cargo run --locked --release --manifest-path "$project_dir/Cargo.toml" -- "$@"

@@ -7,11 +7,13 @@ use crate::{
     ui,
 };
 use crossterm::{
+    cursor::Show,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
     },
     execute,
+    terminal::{EnterAlternateScreen, enable_raw_mode},
 };
 use ratatui::layout::Rect;
 use std::{
@@ -774,11 +776,49 @@ impl App {
 
 struct TerminalGuard {
     signals: Vec<signal_hook::SigId>,
+    active: bool,
+}
+impl TerminalGuard {
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        // Try both even if writing an escape sequence fails: raw mode must be undone.
+        let mouse = execute!(io::stdout(), DisableMouseCapture, Show);
+        let terminal = ratatui::try_restore();
+        mouse.and(terminal)?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn suspend(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
+        self.restore()?;
+        // Keep terminal I/O out of signal handlers. This stops every thread without
+        // unregistering SIGTSTP, so later suspend cycles still take this cleanup path.
+        signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP)?;
+        // Execution continues here after SIGCONT. A termination signal delivered
+        // while stopped takes priority over re-entering the UI.
+        if !stop.load(Ordering::Relaxed) {
+            self.active = true;
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+            terminal.hide_cursor()?;
+            // The shell may have changed the screen and size while we were stopped.
+            // Invalidate the diff buffer so even an unchanged frame is fully redrawn.
+            // Force resize even when dimensions match; unlike clear(), this does
+            // not require a cursor-position query/response from the terminal.
+            terminal.resize(terminal.size()?.into())?;
+        }
+        Ok(())
+    }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-        ratatui::restore();
+        let _ = self.restore();
         for signal in &self.signals {
             signal_hook::low_level::unregister(*signal);
         }
@@ -799,14 +839,20 @@ pub fn run(
     let paused = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel(1);
     let generation = Arc::new(AtomicU64::new(0));
-    let signals = [
+    let mut guard = TerminalGuard {
+        signals: Vec::new(),
+        active: false,
+    };
+    for signal in [
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGHUP,
-    ]
-    .into_iter()
-    .map(|signal| signal_hook::flag::register(signal, stop.clone()))
-    .collect::<io::Result<Vec<_>>>()?;
+        signal_hook::consts::SIGQUIT,
+    ] {
+        guard
+            .signals
+            .push(signal_hook::flag::register(signal, stop.clone())?);
+    }
     let worker_stop = stop.clone();
     let worker_all = show_all.clone();
     let worker_pause = paused.clone();
@@ -846,9 +892,7 @@ pub fn run(
         Ok(Some(snapshot)) => snapshot,
         result => {
             stop.store(true, Ordering::Relaxed);
-            for signal in signals {
-                signal_hook::low_level::unregister(signal);
-            }
+
             return result.map(|_| ());
         }
     };
@@ -856,9 +900,7 @@ pub fn run(
         && attachment.status != AttachmentStatus::Attached
     {
         stop.store(true, Ordering::Relaxed);
-        for signal in signals {
-            signal_hook::low_level::unregister(signal);
-        }
+
         return Err(io::Error::other(format!(
             "could not attach to PID {}: it is not an accessible current-user process in this sample. Use --all to find a PID, then try again.",
             attachment.requested_pid
@@ -868,8 +910,15 @@ pub fn run(
     app.interval = interval;
     app.tour = tour;
     app.no_motion = no_motion;
-    let mut terminal = ratatui::init();
-    let guard = TerminalGuard { signals };
+    let suspend = Arc::new(AtomicBool::new(false));
+    // Before this point SIGTSTP can use its default action: no terminal state has
+    // been changed, including while the first sampler read is still pending.
+    guard.signals.push(signal_hook::flag::register(
+        signal_hook::consts::SIGTSTP,
+        suspend.clone(),
+    )?);
+    guard.active = true;
+    let mut terminal = ratatui::try_init()?;
     execute!(io::stdout(), EnableMouseCapture)?;
     let outcome = (|| -> io::Result<()> {
         let mut dirty = true;
@@ -877,6 +926,11 @@ pub fn run(
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            if suspend.swap(false, Ordering::Relaxed) {
+                guard.suspend(&mut terminal, &stop)?;
+                dirty = true;
+                continue;
             }
             match rx.try_recv() {
                 Ok((epoch, next)) => {
@@ -918,6 +972,13 @@ pub fn run(
                         }
                         if app.editing_rename.is_some() {
                             app.rename_key(key.code);
+                            continue;
+                        }
+                        // Raw mode disables the terminal driver's Ctrl-Z signal.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('z')
+                        {
+                            suspend.store(true, Ordering::Relaxed);
                             continue;
                         }
                         if app.editing_search {
