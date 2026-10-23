@@ -89,10 +89,6 @@ impl SystemSnapshot {
             self.memory_used() as f64 / self.memory_total as f64 * 100.0
         }
     }
-
-    pub fn pressure_label(&self) -> &'static str {
-        "available-memory estimate"
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -416,7 +412,6 @@ mod tests {
         assert!(system.memory_percent() >= 90.0);
         system.memory_available = 101;
         assert_eq!(system.memory_used(), 0);
-        assert_eq!(system.pressure_label(), "available-memory estimate");
     }
 
     #[test]

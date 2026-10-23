@@ -1,0 +1,75 @@
+#!/bin/sh
+# Run the checkout with an existing Rust toolchain. No installs or shell changes.
+set -eu
+
+# Rustup proxies can otherwise implicitly install a missing active toolchain.
+# This applies only to this process and its children, never to the user's shell.
+RUSTUP_AUTO_INSTALL=0
+export RUSTUP_AUTO_INSTALL
+
+fail() {
+    printf 'lattice: %s\n' "$1" >&2
+    shift
+    for hint do
+        printf '%s\n' "$hint" >&2
+    done
+    printf '%s\n' 'Nothing was installed; PATH and shell configuration were not changed.' >&2
+    exit 1
+}
+
+toolchain_fail() {
+    fail "$1" \
+        'Install or update Rust yourself at https://rustup.rs, then rerun this launcher.' \
+        'If Rust is already installed, make cargo and rustc available in your current shell.'
+}
+
+# $0 may be absolute, relative, or found through PATH. Quoting preserves spaces.
+case "$0" in
+    */*) launcher=$0 ;;
+    *) launcher=$(command -v "$0") || fail 'Cannot locate the launcher.' ;;
+esac
+case "$launcher" in
+    */*) launcher_dir=${launcher%/*} ;;
+    *) launcher_dir=. ;;
+esac
+# A leading ./ prevents a directory name beginning with - becoming a cd option.
+case "$launcher_dir" in
+    /*) ;;
+    *) launcher_dir=./$launcher_dir ;;
+esac
+project_dir=$(CDPATH= cd -P "$launcher_dir" && pwd -P) || fail 'Cannot open the launcher directory.'
+cd "$project_dir" || fail 'Cannot open the project directory.'
+if [ ! -f Cargo.toml ] || [ ! -f Cargo.lock ]; then
+    fail 'Keep lattice beside Cargo.toml and Cargo.lock in the lattice checkout.'
+fi
+
+require_toolchain() {
+    tool=$1
+    command -v "$tool" >/dev/null 2>&1 || toolchain_fail "$tool was not found. Cargo and rustc 1.95 or newer are required."
+    version=$("$tool" --version 2>/dev/null) || toolchain_fail "Cannot run $tool. Cargo and rustc 1.95 or newer are required."
+    # Accept the tool's normal version output without eval or external utilities.
+    case "$version" in
+        "$tool "*) release=${version#* } ;;
+        *) toolchain_fail "Cannot read $tool's version. Cargo and rustc 1.95 or newer are required." ;;
+    esac
+    release=${release%% *}
+    case "$release" in
+        *.*.*) ;;
+        *) toolchain_fail "Cannot read $tool's version. Cargo and rustc 1.95 or newer are required." ;;
+    esac
+    major=${release%%.*}
+    rest=${release#*.}
+    minor=${rest%%.*}
+    case "$major:$minor" in
+        *[!0-9:]*|:*|*:) toolchain_fail "Cannot read $tool's version. Cargo and rustc 1.95 or newer are required." ;;
+    esac
+    if ! { [ "$major" -gt 1 ] 2>/dev/null || { [ "$major" -eq 1 ] 2>/dev/null && [ "$minor" -ge 95 ] 2>/dev/null; }; }; then
+        toolchain_fail "$tool is too old. Cargo and rustc 1.95 or newer are required (rustup users: rustup update stable)."
+    fi
+}
+
+require_toolchain cargo
+require_toolchain rustc
+
+# exec preserves signals and exit status; -- keeps application arguments separate.
+exec cargo run --locked --release -- "$@"

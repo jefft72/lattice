@@ -51,6 +51,12 @@ pub struct App {
     search_original: String,
     pub paused: bool,
     pub help: bool,
+    pub help_scroll: usize,
+    pub tour: bool,
+    pub tour_step: usize,
+    pub requested_all: bool,
+    pub no_motion: bool,
+    pub sample_tick: u64,
     pub hitboxes: Vec<(Rect, ui::HitTarget)>,
     pub last_sample: Instant,
     pub interval: Duration,
@@ -62,6 +68,7 @@ impl App {
     pub fn new(snapshot: Snapshot) -> Self {
         let mut insights = Insights::default();
         insights.update(&snapshot);
+        let requested_all = snapshot.all_processes;
         let mut app = Self {
             snapshot,
             selected: None,
@@ -76,6 +83,12 @@ impl App {
             search_original: String::new(),
             paused: false,
             help: false,
+            help_scroll: 0,
+            tour: false,
+            tour_step: 0,
+            requested_all,
+            no_motion: false,
+            sample_tick: 0,
             hitboxes: Vec::new(),
             last_sample: Instant::now(),
             interval: Duration::from_secs(1),
@@ -130,6 +143,56 @@ impl App {
                 && self.last_sample.elapsed()
                     > self.interval.saturating_mul(3).max(Duration::from_secs(3)))
     }
+    pub fn scope_label(&self) -> &'static str {
+        match (self.snapshot.all_processes, self.requested_all) {
+            (false, true) => "AGENTS → ALL",
+            (true, false) => "ALL → AGENTS",
+            (true, true) => "ALL FAMILIES",
+            (false, false) => "AGENTS",
+        }
+    }
+    pub fn sample_marker(&self) -> &'static str {
+        if self.no_motion || self.paused || self.stale() || self.sample_tick.is_multiple_of(2) {
+            "●"
+        } else {
+            "·"
+        }
+    }
+    pub fn guide_key(&mut self, key: KeyCode, page_rows: usize) {
+        if self.tour {
+            match key {
+                KeyCode::Esc => self.tour = false,
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('n') => {
+                    if self.tour_step < 2 {
+                        self.tour_step += 1;
+                    } else {
+                        self.tour = false;
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('b') => {
+                    self.tour_step = self.tour_step.saturating_sub(1)
+                }
+                _ => {}
+            }
+        } else {
+            match key {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => self.help = false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.help_scroll = self.help_scroll.saturating_add(page_rows)
+                }
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page_rows),
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = usize::MAX,
+                _ => {}
+            }
+        }
+    }
     pub fn selected_session(&self) -> Option<&SessionSnapshot> {
         self.snapshot
             .sessions
@@ -159,6 +222,7 @@ impl App {
         }
         self.insights.update(&snapshot);
         self.snapshot = snapshot;
+        self.sample_tick = self.sample_tick.wrapping_add(1);
         self.last_sample = Instant::now();
         self.resuming = false;
         self.pins
@@ -274,7 +338,13 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
+pub fn run(
+    demo: bool,
+    all: bool,
+    interval: Duration,
+    tour: bool,
+    no_motion: bool,
+) -> io::Result<()> {
     // A bounded channel decouples potentially slow process reads from input/rendering.
     let stop = Arc::new(AtomicBool::new(false));
     let show_all = Arc::new(AtomicBool::new(all));
@@ -336,6 +406,8 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
     };
     let mut app = App::new(initial);
     app.interval = interval;
+    app.tour = tour;
+    app.no_motion = no_motion;
     let mut terminal = ratatui::init();
     let guard = TerminalGuard { signals };
     execute!(io::stdout(), EnableMouseCapture)?;
@@ -381,13 +453,12 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
                         if key.code == KeyCode::Char('q') {
                             break;
                         }
-                        if app.help {
-                            if matches!(
-                                key.code,
-                                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter
-                            ) {
-                                app.help = false;
-                            }
+                        if app.help || app.tour {
+                            let size = terminal.size()?;
+                            let (rows, maximum) = ui::guide_scroll_limits(size.width, size.height);
+                            app.help_scroll = app.help_scroll.min(maximum);
+                            app.guide_key(key.code, rows);
+                            app.help_scroll = app.help_scroll.min(maximum);
                             continue;
                         }
                         match key.code {
@@ -429,7 +500,10 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
                                     app.reconcile_selection();
                                 }
                             }
-                            KeyCode::Char('?') => app.help = true,
+                            KeyCode::Char('?') => {
+                                app.help = true;
+                                app.help_scroll = 0;
+                            }
                             KeyCode::Char('/') => app.start_search(),
                             KeyCode::Char('*') => app.toggle_pin(),
                             KeyCode::Char('s') => {
@@ -440,7 +514,8 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('a') => {
-                                show_all.fetch_xor(true, Ordering::Relaxed);
+                                app.requested_all = !app.requested_all;
+                                show_all.store(app.requested_all, Ordering::Relaxed);
                                 generation.fetch_add(1, Ordering::AcqRel);
                                 while rx.try_recv().is_ok() {}
                                 if !app.paused {
@@ -461,7 +536,22 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
                         }
                     }
                     Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) if !app.help => {
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if app.help => {
+                            let size = terminal.size()?;
+                            let (_, maximum) = ui::guide_scroll_limits(size.width, size.height);
+                            app.help_scroll = app.help_scroll.min(maximum);
+                            app.guide_key(
+                                if mouse.kind == MouseEventKind::ScrollDown {
+                                    KeyCode::Down
+                                } else {
+                                    KeyCode::Up
+                                },
+                                1,
+                            );
+                            app.help_scroll = app.help_scroll.min(maximum);
+                            dirty = true;
+                        }
+                        MouseEventKind::Down(MouseButton::Left) if !app.help && !app.tour => {
                             if let Some((_, key)) = app
                                 .hitboxes
                                 .iter()
@@ -471,11 +561,11 @@ pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
                                 dirty = true;
                             }
                         }
-                        MouseEventKind::ScrollDown if !app.help => {
+                        MouseEventKind::ScrollDown if !app.help && !app.tour => {
                             app.move_cursor(1);
                             dirty = true;
                         }
-                        MouseEventKind::ScrollUp if !app.help => {
+                        MouseEventKind::ScrollUp if !app.help && !app.tour => {
                             app.move_cursor(-1);
                             dirty = true;
                         }
@@ -645,5 +735,71 @@ mod interaction_tests {
                 .len()
                 > 1
         );
+    }
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+    #[test]
+    fn sample_marker_changes_only_for_received_samples_and_can_be_disabled() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        let initial = app.sample_marker();
+        app.select(1);
+        assert_eq!(app.sample_marker(), initial);
+        app.update(sampler.sample(false));
+        assert_ne!(app.sample_marker(), initial);
+        app.paused = true;
+        assert_eq!(app.sample_marker(), "●");
+        app.paused = false;
+        app.last_sample = Instant::now() - Duration::from_secs(20);
+        assert_eq!(app.sample_marker(), "●");
+        app.last_sample = Instant::now();
+        app.no_motion = true;
+        for _ in 0..4 {
+            app.update(sampler.sample(false));
+            assert_eq!(app.sample_marker(), "●");
+        }
+    }
+    #[test]
+    fn scope_displays_pending_changes_without_relabeling_frozen_data() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        assert_eq!(app.scope_label(), "AGENTS");
+        app.paused = true;
+        app.requested_all = true;
+        assert_eq!(app.scope_label(), "AGENTS → ALL");
+        assert!(!app.snapshot.all_processes);
+        app.snapshot.all_processes = true;
+        assert_eq!(app.scope_label(), "ALL FAMILIES");
+        app.requested_all = false;
+        assert_eq!(app.scope_label(), "ALL → AGENTS");
+    }
+    #[test]
+    fn tour_navigation_never_switches_to_live_data() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.tour = true;
+        app.guide_key(KeyCode::Left, 10);
+        assert_eq!(app.tour_step, 0);
+        app.guide_key(KeyCode::Enter, 10);
+        app.guide_key(KeyCode::Enter, 10);
+        assert_eq!(app.tour_step, 2);
+        app.guide_key(KeyCode::Enter, 10);
+        assert!(!app.tour);
+        assert!(app.snapshot.demo);
+    }
+    #[test]
+    fn guide_scroll_and_close_do_not_change_underlying_selection() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        let selected = app.selected;
+        app.help = true;
+        app.guide_key(KeyCode::Down, 8);
+        app.guide_key(KeyCode::PageDown, 8);
+        assert_eq!(app.help_scroll, 9);
+        app.guide_key(KeyCode::Home, 8);
+        assert_eq!(app.help_scroll, 0);
+        app.guide_key(KeyCode::Esc, 8);
+        assert!(!app.help);
+        assert_eq!(app.selected, selected);
     }
 }
