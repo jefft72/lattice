@@ -1,4 +1,6 @@
 mod app;
+mod attachment;
+mod changes;
 mod doctor;
 mod explorer;
 mod insights;
@@ -18,7 +20,7 @@ use std::{
     name = "lattice",
     version,
     about = "Your coding sessions, seen as constellations.",
-    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: j/k or arrows select · Enter inspect · / search · * pin · s sort · Space pause · ? help · q quit\n\nRead-only. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
+    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n  ./lattice --pid 12345  Watch an existing dev server or build family\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: j/k or arrows select · Enter inspect · r nickname · e changes · / search · * pin · s sort · Space pause · ? help · q quit\n\nRead-only. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
 )]
 struct Args {
     /// Explore a deterministic simulation instead of live processes.
@@ -36,6 +38,9 @@ struct Args {
     /// Include other process families owned by your OS user.
     #[arg(long)]
     all: bool,
+    /// Attach to an existing current-user PID and its descendants; never launches it.
+    #[arg(long, value_parser=clap::value_parser!(u32).range(1..), conflicts_with_all=["demo", "tour", "doctor", "all", "snapshot"])]
+    pid: Option<u32>,
     /// Sample interval in seconds (0.5–30).
     #[arg(long, default_value="1", value_parser=parse_interval)]
     interval: f64,
@@ -45,6 +50,9 @@ struct Args {
     /// Open the demo snapshot in process-inspector view.
     #[arg(long, requires = "snapshot")]
     inspect: bool,
+    /// Open the demo snapshot in the observed-changes view.
+    #[arg(long, requires = "snapshot", conflicts_with = "inspect")]
+    changes: bool,
     /// Snapshot width in terminal cells (40–240).
     #[arg(long, default_value="144", value_parser=clap::value_parser!(u16).range(40..=240))]
     width: u16,
@@ -80,6 +88,9 @@ fn main() -> io::Result<()> {
             app.focused = true;
             app.focus = app::Focus::Processes;
         }
+        if args.changes {
+            app.open_changes();
+        }
         ui::save_svg(&app, args.width, args.height, &path)?;
         println!("Saved deterministic demo to {}", path.display());
         return Ok(());
@@ -95,6 +106,7 @@ fn main() -> io::Result<()> {
         Duration::from_secs_f64(args.interval),
         args.tour,
         args.no_motion,
+        args.pid,
     )
 }
 

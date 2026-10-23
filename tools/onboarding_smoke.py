@@ -21,14 +21,14 @@ import unicodedata
 
 
 class Terminal:
-    def __init__(self, binary, width, height, tour=True, no_motion=True, interval="30"):
+    def __init__(self, binary, width, height, tour=True, no_motion=True, interval="30", extra_args=None):
         self.width, self.height = width, height
         self.master, self.slave = pty.openpty()
         self.original = termios.tcgetattr(self.slave)
         self.output = bytearray()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
         self.process = subprocess.Popen(
-            [str(binary), "--tour" if tour else "--demo", "--interval", interval,
+            [str(binary), *(extra_args if extra_args is not None else ["--tour" if tour else "--demo"]), "--interval", interval,
              *(["--no-motion"] if no_motion else [])],
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
             env={**os.environ, "TERM": "xterm-256color"},

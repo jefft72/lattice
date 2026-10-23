@@ -92,3 +92,56 @@ fn quickstart_exposes_local_launch_tour_live_and_diagnostics() {
         assert!(text.contains(expected), "{text}");
     }
 }
+
+#[test]
+fn pid_attachment_is_positive_explicit_live_and_not_a_launcher() {
+    for args in [
+        vec!["--pid", "0"],
+        vec!["--pid", "-1"],
+        vec!["--pid", "4294967296"],
+        vec!["--pid", "123", "--demo"],
+        vec!["--pid", "123", "--tour"],
+        vec!["--pid", "123", "--doctor"],
+        vec!["--pid", "123", "--all"],
+        vec!["--pid", "123", "--", "echo"],
+        vec!["--changes"],
+    ] {
+        let output = binary().args(&args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+    }
+    let help = binary().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("./lattice --pid 12345"));
+    assert!(help.contains("never launches"));
+    assert!(help.contains("r nickname"));
+    assert!(help.contains("e changes"));
+}
+
+#[test]
+fn changes_demo_export_contains_observed_events_without_live_access() {
+    let dir = std::env::temp_dir().join(format!("lattice-changes-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("changes.svg");
+    let output = binary()
+        .args(["--demo", "--changes", "--snapshot"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let svg = fs::read_to_string(&path).unwrap();
+    let rendered: String = svg
+        .split("</text>")
+        .filter_map(|part| part.rsplit_once('>').map(|(_, text)| text))
+        .collect();
+    for text in [
+        "WHAT CHANGED",
+        "Observed, not causes",
+        "vite",
+        "not seen",
+        "no disk log",
+    ] {
+        assert!(rendered.contains(&text.replace(' ', "")), "missing {text}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

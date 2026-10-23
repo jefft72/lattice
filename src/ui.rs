@@ -1,6 +1,7 @@
 //! One terminal-cell renderer powers the live UI, tests, and deterministic SVG exports.
 use crate::{
     app::{App, Focus, Sort},
+    changes::{ChangeKind, ContributorStatus},
     insights::HeadroomLevel,
     model::{ProcessKey, SessionSnapshot},
 };
@@ -248,7 +249,7 @@ impl Widget for Dashboard<'_> {
             s.text(
                 3,
                 footer_y,
-                if app.focused { "↑↓ move  ←→ fold  tab pane  / find  a scope  space pause  esc back  ? help  q quit" } else { "↑↓ select  ↵ inspect  / find  * pin  s sort  a scope  space pause  ? help  q quit" },
+                (if app.focused { "↑↓ move  ←→ fold  tab pane  r name  e changes  / find  a scope  esc back  ? help  q quit" } else { "↑↓ select  ↵ inspect  / find  * pin  r name  e changes  s sort  a scope  ? help  q quit" }).replace("a scope", if app.snapshot.attachment.is_some() { "PID lock" } else { "a scope" }),
                 DIM,
             );
             if width >= 132 {
@@ -261,15 +262,21 @@ impl Widget for Dashboard<'_> {
                 if width < 72 {
                     "↑↓ move  ↵ inspect  a scope  ? help  q quit"
                 } else if app.focused {
-                    "↑↓ move  ←→ fold  tab pane  a scope  ? help  q quit"
+                    "↑↓ move  ←→ fold  tab pane  r name  e changes  ? help  q quit"
                 } else {
-                    "↑↓ select  ↵ inspect  / find  a scope  ? help  q quit"
+                    "↑↓ select  ↵ inspect  r name  e changes  ? help  q quit"
                 },
                 DIM,
             );
         }
         if app.help || app.tour {
             guide(&mut s, app);
+        }
+        if app.show_changes {
+            changes_view(&mut s, app);
+        }
+        if app.editing_rename.is_some() {
+            rename_view(&mut s, app);
         }
     }
 }
@@ -329,6 +336,8 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
             s.text(1, 3, "Sampler stopped. Values are stale.", RED);
         } else if app.stale() {
             s.text(1, 3, "Waiting for sampler. Data stale.", PEACH);
+        } else if let Some(notice) = app.attachment_notice() {
+            s.text(1, 3, notice, PEACH);
         } else if app.snapshot.truncated {
             s.text(1, 3, "Scan limit reached. Partial data.", PEACH);
         } else if app.insights.headroom().level == HeadroomLevel::Critical {
@@ -382,8 +391,7 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
                         } else {
                             " "
                         },
-                        session
-                            .label
+                        app.display_label(session)
                             .chars()
                             .take((w as usize).saturating_sub(
                                 bytes(session.rss_bytes()).chars().count()
@@ -399,11 +407,29 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
             }
         }
     }
+    if h > 2 {
+        s.text(1, h - 2, "↵ inspect  r name  e changes", DIM);
+    }
     if h > 1 {
-        s.text(1, h - 1, "↑↓ move  a scope  ? help  q quit", DIM);
+        s.text(
+            1,
+            h - 1,
+            if app.snapshot.attachment.is_some() {
+                "↑↓ move  PID locked  ? help  q quit"
+            } else {
+                "↑↓ move  a scope  ? help  q quit"
+            },
+            DIM,
+        );
     }
     if app.help || app.tour {
         guide(s, app);
+    }
+    if app.show_changes {
+        changes_view(s, app);
+    }
+    if app.editing_rename.is_some() {
+        rename_view(s, app);
     }
 }
 
@@ -504,6 +530,8 @@ fn metrics(s: &mut Surface<'_>, app: &App) {
         s.text(x3, y + 2, "Sampler stopped · data is stale", RED);
     } else if app.stale() {
         s.text(x3, y + 2, "Waiting for sampler · data stale", PEACH);
+    } else if let Some(notice) = app.attachment_notice() {
+        s.text(x3, y + 2, notice, PEACH);
     } else if app.snapshot.truncated {
         s.text(x3, y + 2, "Scan limit reached · partial data", PEACH);
     } else if system.memory_total == 0 {
@@ -571,8 +599,7 @@ fn session_list(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(
                 } else {
                     "○"
                 },
-                session
-                    .label
+                app.display_label(session)
                     .chars()
                     .take(area.width.saturating_sub(15) as usize)
                     .collect::<String>()
@@ -647,7 +674,9 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
         s.bold(
             area.x + 3,
             area.y + area.height / 2,
-            if !app.query.is_empty() {
+            if app.attachment_notice().is_some() {
+                "Attached root not observed."
+            } else if !app.query.is_empty() {
                 "No filter matches."
             } else if app.snapshot.all_processes {
                 "No accessible process families."
@@ -660,7 +689,11 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
             s.text(
                 area.x + 3,
                 area.y + area.height / 2 + 2,
-                "claude · codex · aider · opencode · goose",
+                if app.snapshot.attachment.is_some() {
+                    "No exit cause is inferred. Identity stays locked."
+                } else {
+                    "claude · codex · aider · opencode · goose"
+                },
                 DIM,
             );
         }
@@ -669,7 +702,7 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
     let focused = app.focused || s.area.width < 120 || area.height < 16;
     if focused {
         if let Some(session) = app.selected_session() {
-            constellation(s, session, area, true, hitboxes);
+            constellation(s, session, area, true, hitboxes, app.display_label(session));
         }
     } else {
         let mut shown: Vec<_> = sessions.into_iter().take(4).collect();
@@ -694,6 +727,7 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
                 rect,
                 Some(session.key) == app.selected,
                 hitboxes,
+                app.display_label(session),
             );
         }
     }
@@ -711,6 +745,7 @@ fn focus_view(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Re
             Rect::new(area.x, area.y, area.width, graph_h),
             true,
             hitboxes,
+            app.display_label(session),
         );
         process_table(
             s,
@@ -840,6 +875,7 @@ fn constellation(
     area: Rect,
     active: bool,
     hitboxes: &mut Vec<(Rect, HitTarget)>,
+    label: &str,
 ) {
     if area.width < 12 || area.height < 3 {
         return;
@@ -849,7 +885,7 @@ fn constellation(
     s.bold(
         area.x + 1,
         area.y,
-        format!("{} {}", if active { "◉" } else { "○" }, session.label),
+        format!("{} {}", if active { "◉" } else { "○" }, label),
         ink,
     );
     let subtitle = format!("#{} · {}", session.key.pid, bytes(session.rss_bytes()));
@@ -907,11 +943,7 @@ fn constellation(
                 },
                 if root || hot { ink } else { DIM },
             );
-            let name = if root {
-                session.label.as_str()
-            } else {
-                &process.name
-            };
+            let name = if root { label } else { &process.name };
             let next_column = positions
                 .iter()
                 .map(|(_, xx, _)| *xx)
@@ -1112,24 +1144,28 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
         return;
     };
     let c = color(session);
-    s.bold(
-        3,
-        y + 1,
-        format!("◉ {} / #{}", session.label, session.pid()),
-        c,
-    );
     let info = format!(
         "{} RSS   {} CPU   {} processes",
         bytes(session.rss_bytes()),
         cpu(session.cpu_percent()),
         session.process_count()
     );
-    s.text(
-        width.saturating_sub(info.len() as u16 + 3),
+    let info_x = width.saturating_sub(info.len() as u16 + 3);
+    let label_width = info_x.saturating_sub(9 + session.pid().to_string().len() as u16) as usize;
+    s.bold(
+        3,
         y + 1,
-        info,
-        TEXT,
+        format!(
+            "◉ {} / #{}",
+            app.display_label(session)
+                .chars()
+                .take(label_width)
+                .collect::<String>(),
+            session.pid()
+        ),
+        c,
     );
+    s.text(info_x, y + 1, info, TEXT);
     if height < 7 {
         s.text(
             3,
@@ -1220,7 +1256,9 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
 }
 
 fn empty_title(app: &App) -> &'static str {
-    if !app.query.is_empty() {
+    if app.attachment_notice().is_some() {
+        "Attached root not observed."
+    } else if !app.query.is_empty() {
         "No filter matches."
     } else if app.snapshot.all_processes {
         "No accessible families."
@@ -1229,7 +1267,9 @@ fn empty_title(app: &App) -> &'static str {
     }
 }
 fn empty_hint(app: &App) -> &'static str {
-    if !app.query.is_empty() && app.focused {
+    if app.attachment_notice().is_some() {
+        "Identity is locked; no automatic reattach. The cause is unknown. Quit and choose a current --pid to start again."
+    } else if !app.query.is_empty() && app.focused {
         "Esc returns to sessions; Esc again clears the filter. Scope totals stay unfiltered."
     } else if !app.query.is_empty() {
         "Search checks names and PIDs. Esc clears the filter. Scope totals stay unfiltered."
@@ -1289,12 +1329,33 @@ const GUIDE: &[(&str, Color)] = &[
         TEXT,
     ),
     (
-        "q quits. Ctrl-C always quits, even while searching. ? or Esc closes this guide.",
+        "q quits except while typing a search or nickname. Ctrl-C always quits. ? or Esc closes this guide.",
+        TEXT,
+    ),
+    ("MAKE IT YOUR WORKSPACE", MINT),
+    (
+        "r names the selected session for this run. Names are bounded, terminal-safe, and tied to PID/start identity, not inherited when the start identity changes. Empty name restores the original. At most 128 names are retained.",
+        TEXT,
+    ),
+    (
+        "e opens What Changed: observed appearances, disappearances, and RSS growth between comparable samples. It is memory-only, keeps 128 events, and does not infer causes or leaks. Enter inspects a family still present.",
+        TEXT,
+    ),
+    (
+        "Growth is significant at max(32 MiB, 5% of previous family RSS) in one sample interval. Largest signed process RSS changes are contributors to the observed total, not evidence of a cause.",
+        TEXT,
+    ),
+    (
+        "./lattice --pid 12345 attaches to an existing owned process and its observed descendants, including builds or dev servers. Find its PID with --all. No commands are launched; no process is controlled.",
+        TEXT,
+    ),
+    (
+        "PID mode locks the first observed start identity and disables scope switching. If the root is no longer accessible or its identity changes, it never silently reattaches. Start times have one-second precision.",
         TEXT,
     ),
     ("READ THE CONSTELLATIONS", LILAC),
     (
-        "Lines mean parent to child, not network traffic. Each PID belongs to one session. Nested agents form separate sessions.",
+        "Lines mean parent to child, not network traffic. Each PID belongs to one session. Nested agents form separate sessions, except inside an explicit PID family.",
         TEXT,
     ),
     (
@@ -1440,6 +1501,220 @@ fn guide(s: &mut Surface<'_>, app: &App) {
             DIM,
         );
     }
+}
+
+fn signed_bytes(delta: i64) -> String {
+    format!(
+        "{}{}",
+        if delta >= 0 { "+" } else { "−" },
+        bytes(delta.unsigned_abs())
+    )
+}
+fn rename_view(s: &mut Surface<'_>, app: &App) {
+    let Some(key) = app.editing_rename else {
+        return;
+    };
+    let width = s.area.width.saturating_sub(4).clamp(1, 66);
+    let height = s.area.height.saturating_sub(2).clamp(1, 10);
+    let r = Rect::new(
+        s.area.width.saturating_sub(width) / 2,
+        s.area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    s.fill(r, PANEL);
+    if width < 10 || height < 5 {
+        return;
+    }
+    let inner = width.saturating_sub(4) as usize;
+    s.bold(r.x + 2, r.y, format!("NAME SESSION · #{}", key.pid), MINT);
+    s.text(r.x + 2, r.y + 1, "This run only · 24 safe characters", DIM);
+    s.bold(r.x + 2, r.y + 3, format!("{}▏", app.rename_text), TEXT);
+    let hint = "Letters, digits, spaces, . _ - +. Empty restores the original name.";
+    for (i, line) in wrap_line(hint, inner).into_iter().enumerate() {
+        if 5 + (i as u16) < height.saturating_sub(1) {
+            s.text(r.x + 2, r.y + 5 + i as u16, line, DIM);
+        }
+    }
+    s.text(
+        r.x + 2,
+        r.bottom() - 1,
+        "enter save  esc cancel  ^C quit",
+        DIM,
+    );
+}
+fn changes_view(s: &mut Surface<'_>, app: &App) {
+    let r = guide_rect(s.area.width, s.area.height);
+    s.fill(r, PANEL);
+    if r.width < 12 || r.height < 7 {
+        return;
+    }
+    let inner = r.width.saturating_sub(4);
+    let entries: Vec<_> = app.changes.events().iter().rev().collect();
+    s.bold(
+        r.x + 2,
+        r.y,
+        format!("WHAT CHANGED · {} kept", entries.len()),
+        MINT,
+    );
+    s.text(r.x + 2, r.y + 1, "Observed, not causes · memory only", DIM);
+    if entries.is_empty() {
+        let message = "No changes observed yet. The first sample primes a baseline. Growth means at least 32 MiB and 5% of previous family RSS in one sample interval. Appearances and disappearances are observations, not exit causes.";
+        for (i, line) in wrap_line(message, inner as usize).into_iter().enumerate() {
+            if i as u16 + 3 < r.height.saturating_sub(1) {
+                s.text(r.x + 2, r.y + 3 + i as u16, line, TEXT);
+            }
+        }
+        s.text(r.x + 2, r.bottom() - 1, "esc back  e close  q quit", DIM);
+        return;
+    }
+    let selected = entries
+        .iter()
+        .position(|event| Some(event.sequence) == app.change_selected)
+        .unwrap_or(0);
+    let detail_height: u16 = if r.height >= 20 { 7 } else { 6 };
+    let row_height: u16 = if inner >= 60 { 2 } else { 1 };
+    let list_height = r.height.saturating_sub(detail_height + 4);
+    let visible = (list_height / row_height).max(1) as usize;
+    let start = selected.saturating_sub(visible - 1);
+    for (offset, event) in entries.iter().skip(start).take(visible).enumerate() {
+        let y = r.y + 3 + offset as u16 * row_height;
+        let active = offset + start == selected;
+        if active {
+            s.fill(
+                Rect::new(r.x + 1, y, r.width.saturating_sub(2), row_height),
+                SELECT,
+            );
+        }
+        let label = app
+            .nicknames
+            .get(&event.session_key)
+            .map(String::as_str)
+            .unwrap_or(&event.session_name);
+        let tail = format!(
+            " #{} {}",
+            event.session_key.pid,
+            signed_bytes(event.rss_delta_bytes)
+        );
+        let name_width = (inner as usize).saturating_sub(tail.chars().count() + 2);
+        s.text(
+            r.x + 2,
+            y,
+            format!(
+                "{} {}{}",
+                if active { "›" } else { " " },
+                label.chars().take(name_width).collect::<String>(),
+                tail
+            ),
+            if active { MINT } else { TEXT },
+        );
+        if row_height == 2 {
+            let kind = match event.kind {
+                ChangeKind::Appeared => "family first seen",
+                ChangeKind::Disappeared => "family not seen",
+                ChangeKind::Changed if event.significant_growth => "RSS growth",
+                ChangeKind::Changed => "membership changed",
+            };
+            s.text(
+                r.x + 4,
+                y + 1,
+                format!(
+                    "t+{:.0}s · {kind} · +{} / −{} processes",
+                    event.monotonic, event.appeared, event.disappeared
+                )
+                .chars()
+                .take(inner.saturating_sub(2) as usize)
+                .collect::<String>(),
+                DIM,
+            );
+        }
+    }
+    let event = entries[selected];
+    let y = r.bottom().saturating_sub(detail_height + 1);
+    s.rule(r.x + 2, y, inner);
+    s.text(
+        r.x + 2,
+        y + 1,
+        format!(
+            "+{} seen / −{} not seen · RSS {}",
+            event.appeared,
+            event.disappeared,
+            signed_bytes(event.rss_delta_bytes)
+        )
+        .chars()
+        .take(inner as usize)
+        .collect::<String>(),
+        LILAC,
+    );
+    for (i, item) in event.contributors.iter().take(3).enumerate() {
+        let status = match item.status {
+            ContributorStatus::Present => "delta",
+            ContributorStatus::Appeared => "new",
+            ContributorStatus::Disappeared => "not seen",
+        };
+        let prefix = format!("{} ", signed_bytes(item.delta_bytes));
+        let suffix = format!(" #{} {status}", item.key.pid);
+        let name_width =
+            (inner as usize).saturating_sub(prefix.chars().count() + suffix.chars().count());
+        s.text(
+            r.x + 2,
+            y + 2 + i as u16,
+            format!(
+                "{}{}{}",
+                prefix,
+                item.name.chars().take(name_width).collect::<String>(),
+                suffix
+            ),
+            TEXT,
+        );
+    }
+    if detail_height >= 7 {
+        let live = app
+            .snapshot
+            .sessions
+            .iter()
+            .any(|session| session.key == event.session_key);
+        s.text(
+            r.x + 2,
+            y + 5,
+            format!(
+                "Top 3 signed RSS contributors · {}",
+                if live {
+                    "Enter inspects family"
+                } else {
+                    "family not in latest sample"
+                }
+            )
+            .chars()
+            .take(inner as usize)
+            .collect::<String>(),
+            DIM,
+        );
+        s.text(
+            r.x + 2,
+            y + 6,
+            format!(
+                "{}/{} · {} older events discarded · no disk log",
+                selected + 1,
+                entries.len(),
+                app.changes.dropped_events()
+            )
+            .chars()
+            .take(inner as usize)
+            .collect::<String>(),
+            DIM,
+        );
+    }
+    s.text(
+        r.x + 2,
+        r.bottom() - 1,
+        if inner >= 55 {
+            "↑↓ browse  enter inspect  esc back  e close  q quit"
+        } else {
+            "↑↓ move  ↵ inspect  esc  q quit"
+        },
+        DIM,
+    );
 }
 
 fn xml(value: &str) -> String {
@@ -1893,6 +2168,96 @@ mod narrow_identity_regression {
             );
             assert!(text.contains('*'));
             assert!(text.contains("#4100"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod practical_ui_tests {
+    use super::*;
+    use crate::{
+        model::{AttachmentSnapshot, AttachmentStatus},
+        sampling::DemoSampler,
+    };
+    fn render(w: u16, h: u16, app: &App) -> String {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        Dashboard {
+            app,
+            hitboxes: &mut Vec::new(),
+        }
+        .render(area, &mut buf);
+        buf.content
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn practical_modals_preserve_identity_and_quit_cues_at_supported_sizes() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..59 {
+            app.update(sampler.sample(false));
+        }
+        for (w, h) in [(40, 16), (58, 19), (72, 22), (80, 24), (144, 44)] {
+            app.start_rename();
+            app.rename_text = "CalHacks API".into();
+            let text = render(w, h, &app);
+            assert!(text.contains("NAME SESSION · #4100"), "{w}x{h}\n{text}");
+            assert!(text.contains("CalHacks API"));
+            assert!(text.contains("^C quit"));
+            app.rename_key(crossterm::event::KeyCode::Esc);
+            app.open_changes();
+            let text = render(w, h, &app);
+            for expected in [
+                "WHAT CHANGED",
+                "Observed, not causes",
+                "vite",
+                "not seen",
+                "q quit",
+            ] {
+                assert!(text.contains(expected), "{w}x{h}: {expected}\n{text}");
+            }
+            app.show_changes = false;
+        }
+    }
+    #[test]
+    fn event_empty_state_is_actionable_and_tiny_modals_do_not_panic() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.open_changes();
+        let text = render(40, 16, &app);
+        assert!(text.contains("No changes observed yet."));
+        assert!(text.contains("q quit"));
+        for w in 1..80 {
+            for h in 1..24 {
+                app.editing_rename = None;
+                render(w, h, &app);
+                app.start_rename();
+                render(w, h, &app);
+            }
+        }
+    }
+    #[test]
+    fn attached_root_loss_is_not_presented_as_generic_agent_empty_state() {
+        let mut snapshot = DemoSampler::new().sample(false);
+        snapshot.demo = false;
+        snapshot.attachment = Some(AttachmentSnapshot {
+            requested_pid: 4100,
+            root: Some(snapshot.sessions[0].key),
+            status: AttachmentStatus::Ended,
+        });
+        snapshot.sessions.clear();
+        let app = App::new(snapshot);
+        for (w, h) in [(40, 16), (80, 24), (144, 44)] {
+            let text = render(w, h, &app);
+            assert!(text.contains("PID UNSEEN"), "{text}");
+            assert!(
+                text.contains("Root no longer observed")
+                    || text.contains("Attached root not observed"),
+                "{text}"
+            );
+            assert!(!text.contains("No agents found"), "{text}");
         }
     }
 }

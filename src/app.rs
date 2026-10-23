@@ -1,7 +1,8 @@
 use crate::{
+    changes::Changes,
     explorer::Explorer,
     insights::{Insights, rss_delta},
-    model::{ProcessKey, SessionSnapshot, Snapshot},
+    model::{AttachmentStatus, ProcessKey, SessionSnapshot, Snapshot},
     sampling::{DemoSampler, LiveSampler},
     ui,
 };
@@ -14,7 +15,7 @@ use crossterm::{
 };
 use ratatui::layout::Rect;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::{
         Arc,
@@ -46,6 +47,13 @@ pub struct App {
     pub explorer: Explorer,
     pub insights: Insights,
     pub pins: HashSet<ProcessKey>,
+    pub nicknames: HashMap<ProcessKey, String>,
+    nickname_order: VecDeque<ProcessKey>,
+    pub editing_rename: Option<ProcessKey>,
+    pub rename_text: String,
+    pub changes: Changes,
+    pub show_changes: bool,
+    pub change_selected: Option<u64>,
     pub query: String,
     pub editing_search: bool,
     search_original: String,
@@ -69,6 +77,8 @@ impl App {
         let mut insights = Insights::default();
         insights.update(&snapshot);
         let requested_all = snapshot.all_processes;
+        let mut changes = Changes::default();
+        changes.observe(&snapshot);
         let mut app = Self {
             snapshot,
             selected: None,
@@ -78,6 +88,13 @@ impl App {
             explorer: Explorer::default(),
             insights,
             pins: HashSet::new(),
+            nicknames: HashMap::new(),
+            nickname_order: VecDeque::new(),
+            editing_rename: None,
+            rename_text: String::new(),
+            changes,
+            show_changes: false,
+            change_selected: None,
             query: String::new(),
             editing_search: false,
             search_original: String::new(),
@@ -107,6 +124,7 @@ impl App {
             .filter(|s| {
                 query.is_empty()
                     || s.label.to_ascii_lowercase().contains(&query)
+                    || self.display_label(s).to_ascii_lowercase().contains(&query)
                     || s.key.pid.to_string().contains(&query)
                     || s.processes.iter().any(|p| {
                         p.name.to_ascii_lowercase().contains(&query)
@@ -128,6 +146,106 @@ impl App {
         });
         sessions
     }
+    pub fn display_label<'a>(&'a self, session: &'a SessionSnapshot) -> &'a str {
+        self.nicknames
+            .get(&session.key)
+            .map(String::as_str)
+            .unwrap_or(&session.label)
+    }
+    pub fn start_rename(&mut self) {
+        if let Some(key) = self.selected {
+            self.editing_rename = Some(key);
+            self.rename_text = self.nicknames.get(&key).cloned().unwrap_or_default();
+        }
+    }
+    pub fn rename_key(&mut self, key: KeyCode) {
+        let Some(target) = self.editing_rename else {
+            return;
+        };
+        match key {
+            KeyCode::Esc => {
+                self.editing_rename = None;
+                self.rename_text.clear();
+            }
+            KeyCode::Enter => {
+                let name = self.rename_text.trim().to_string();
+                self.nickname_order.retain(|key| *key != target);
+                if name.is_empty() {
+                    self.nicknames.remove(&target);
+                } else {
+                    if self.nicknames.len() >= 128
+                        && !self.nicknames.contains_key(&target)
+                        && let Some(oldest) = self.nickname_order.pop_front()
+                    {
+                        self.nicknames.remove(&oldest);
+                    }
+                    self.nicknames.insert(target, name);
+                    self.nickname_order.push_back(target);
+                }
+                self.editing_rename = None;
+                self.rename_text.clear();
+                self.reconcile_selection();
+            }
+            KeyCode::Backspace => {
+                self.rename_text.pop();
+            }
+            KeyCode::Char(c)
+                if self.rename_text.len() < 24
+                    && (c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '+')) =>
+            {
+                self.rename_text.push(c)
+            }
+            _ => {}
+        }
+    }
+    pub fn open_changes(&mut self) {
+        self.show_changes = true;
+        self.change_selected = self.changes.events().back().map(|event| event.sequence);
+    }
+    pub fn changes_key(&mut self, key: KeyCode) {
+        let events = self.changes.events();
+        let len = events.len();
+        let index = events
+            .iter()
+            .rev()
+            .position(|event| Some(event.sequence) == self.change_selected)
+            .unwrap_or(0);
+        let new_index = match key {
+            KeyCode::Esc | KeyCode::Char('e') => {
+                self.show_changes = false;
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => index.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => index.saturating_sub(1),
+            KeyCode::PageDown => index.saturating_add(5),
+            KeyCode::PageUp => index.saturating_sub(5),
+            KeyCode::Home => 0,
+            KeyCode::End => len.saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(event) = events.iter().rev().nth(index)
+                    && self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .any(|session| session.key == event.session_key)
+                {
+                    self.selected = Some(event.session_key);
+                    self.query.clear();
+                    self.focused = true;
+                    self.focus = Focus::Processes;
+                    self.show_changes = false;
+                    self.reconcile_explorer();
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.change_selected = events
+            .iter()
+            .rev()
+            .nth(new_index.min(len.saturating_sub(1)))
+            .map(|event| event.sequence);
+    }
     pub fn growth_delta(&self, session: &SessionSnapshot) -> i64 {
         self.insights
             .growth(session.key)
@@ -143,7 +261,25 @@ impl App {
                 && self.last_sample.elapsed()
                     > self.interval.saturating_mul(3).max(Duration::from_secs(3)))
     }
+    pub fn attachment_notice(&self) -> Option<&'static str> {
+        self.snapshot
+            .attachment
+            .and_then(|attachment| match attachment.status {
+                AttachmentStatus::Attached => None,
+                AttachmentStatus::Missing => Some("Requested PID not observed"),
+                AttachmentStatus::Unavailable => Some("Root access unavailable"),
+                AttachmentStatus::Ended => Some("Root no longer observed"),
+                AttachmentStatus::IdentityChanged => Some("PID identity changed; stopped"),
+            })
+    }
     pub fn scope_label(&self) -> &'static str {
+        if self.snapshot.attachment.is_some() {
+            return if self.attachment_notice().is_some() {
+                "PID UNSEEN"
+            } else {
+                "PID FAMILY"
+            };
+        }
         match (self.snapshot.all_processes, self.requested_all) {
             (false, true) => "AGENTS → ALL",
             (true, false) => "ALL → AGENTS",
@@ -217,8 +353,19 @@ impl App {
         }
     }
     pub fn update(&mut self, snapshot: Snapshot) {
-        if self.snapshot.all_processes != snapshot.all_processes {
+        if self.stale() || self.snapshot.all_processes != snapshot.all_processes {
             self.insights.mark_gap();
+            self.changes.mark_gap();
+        }
+        self.changes.observe(&snapshot);
+        if self.show_changes
+            && !self
+                .changes
+                .events()
+                .iter()
+                .any(|event| Some(event.sequence) == self.change_selected)
+        {
+            self.change_selected = self.changes.events().back().map(|event| event.sequence);
         }
         self.insights.update(&snapshot);
         self.snapshot = snapshot;
@@ -344,6 +491,7 @@ pub fn run(
     interval: Duration,
     tour: bool,
     no_motion: bool,
+    pid: Option<u32>,
 ) -> io::Result<()> {
     // A bounded channel decouples potentially slow process reads from input/rendering.
     let stop = Arc::new(AtomicBool::new(false));
@@ -365,7 +513,7 @@ pub fn run(
     let worker_generation = generation.clone();
     let worker = thread::spawn(move || {
         let mut demo_sampler = demo.then(DemoSampler::new);
-        let mut live_sampler = (!demo).then(LiveSampler::new);
+        let mut live_sampler = (!demo).then(|| pid.map(LiveSampler::with_pid).unwrap_or_default());
         while !worker_stop.load(Ordering::Relaxed) {
             let start = Instant::now();
             let sample_generation = worker_generation.load(Ordering::Acquire);
@@ -404,6 +552,18 @@ pub fn run(
             return result.map(|_| ());
         }
     };
+    if let Some(attachment) = initial.attachment
+        && attachment.status != AttachmentStatus::Attached
+    {
+        stop.store(true, Ordering::Relaxed);
+        for signal in signals {
+            signal_hook::low_level::unregister(signal);
+        }
+        return Err(io::Error::other(format!(
+            "could not attach to PID {}: it is not an accessible current-user process in this sample. Use --all to find a PID, then try again.",
+            attachment.requested_pid
+        )));
+    }
     let mut app = App::new(initial);
     app.interval = interval;
     app.tour = tour;
@@ -446,12 +606,20 @@ pub fn run(
                         {
                             break;
                         }
+                        if app.editing_rename.is_some() {
+                            app.rename_key(key.code);
+                            continue;
+                        }
                         if app.editing_search {
                             app.search_key(key.code);
                             continue;
                         }
                         if key.code == KeyCode::Char('q') {
                             break;
+                        }
+                        if app.show_changes {
+                            app.changes_key(key.code);
+                            continue;
                         }
                         if app.help || app.tour {
                             let size = terminal.size()?;
@@ -505,6 +673,8 @@ pub fn run(
                                 app.help_scroll = 0;
                             }
                             KeyCode::Char('/') => app.start_search(),
+                            KeyCode::Char('r') => app.start_rename(),
+                            KeyCode::Char('e') => app.open_changes(),
                             KeyCode::Char('*') => app.toggle_pin(),
                             KeyCode::Char('s') => {
                                 app.sort = match app.sort {
@@ -513,7 +683,7 @@ pub fn run(
                                     Sort::Growth => Sort::Memory,
                                 }
                             }
-                            KeyCode::Char('a') => {
+                            KeyCode::Char('a') if app.snapshot.attachment.is_none() => {
                                 app.requested_all = !app.requested_all;
                                 show_all.store(app.requested_all, Ordering::Relaxed);
                                 generation.fetch_add(1, Ordering::AcqRel);
@@ -526,6 +696,7 @@ pub fn run(
                                 app.paused = !app.paused;
                                 if !app.paused {
                                     app.insights.mark_gap();
+                                    app.changes.mark_gap();
                                 }
                                 paused.store(app.paused, Ordering::Release);
                                 generation.fetch_add(1, Ordering::AcqRel);
@@ -536,6 +707,16 @@ pub fn run(
                         }
                     }
                     Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                            if app.show_changes =>
+                        {
+                            app.changes_key(if mouse.kind == MouseEventKind::ScrollDown {
+                                KeyCode::Down
+                            } else {
+                                KeyCode::Up
+                            });
+                            dirty = true;
+                        }
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if app.help => {
                             let size = terminal.size()?;
                             let (_, maximum) = ui::guide_scroll_limits(size.width, size.height);
@@ -551,7 +732,12 @@ pub fn run(
                             app.help_scroll = app.help_scroll.min(maximum);
                             dirty = true;
                         }
-                        MouseEventKind::Down(MouseButton::Left) if !app.help && !app.tour => {
+                        MouseEventKind::Down(MouseButton::Left)
+                            if !app.help
+                                && !app.tour
+                                && !app.show_changes
+                                && app.editing_rename.is_none() =>
+                        {
                             if let Some((_, key)) = app
                                 .hitboxes
                                 .iter()
@@ -561,11 +747,21 @@ pub fn run(
                                 dirty = true;
                             }
                         }
-                        MouseEventKind::ScrollDown if !app.help && !app.tour => {
+                        MouseEventKind::ScrollDown
+                            if !app.help
+                                && !app.tour
+                                && !app.show_changes
+                                && app.editing_rename.is_none() =>
+                        {
                             app.move_cursor(1);
                             dirty = true;
                         }
-                        MouseEventKind::ScrollUp if !app.help && !app.tour => {
+                        MouseEventKind::ScrollUp
+                            if !app.help
+                                && !app.tour
+                                && !app.show_changes
+                                && app.editing_rename.is_none() =>
+                        {
                             app.move_cursor(-1);
                             dirty = true;
                         }
@@ -801,5 +997,167 @@ mod onboarding_tests {
         app.guide_key(KeyCode::Esc, 8);
         assert!(!app.help);
         assert_eq!(app.selected, selected);
+    }
+}
+
+#[cfg(test)]
+mod practical_tests {
+    use super::*;
+
+    fn rename(app: &mut App, value: &str) {
+        app.start_rename();
+        app.rename_text.clear();
+        for character in value.chars() {
+            app.rename_key(KeyCode::Char(character));
+        }
+        app.rename_key(KeyCode::Enter);
+    }
+
+    #[test]
+    fn nicknames_are_bounded_sanitized_searchable_and_resettable() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        let key = app.selected.unwrap();
+        rename(&mut app, "  quick API /\x1b\n🌟  ");
+        assert_eq!(app.nicknames[&key], "quick API");
+        app.query = "QUICK".into();
+        assert_eq!(app.sessions().len(), 1);
+        app.query = "claude".into();
+        assert_eq!(app.sessions().len(), 1); // Original name remains searchable.
+        app.query.clear();
+        rename(&mut app, &"a".repeat(100));
+        assert_eq!(app.nicknames[&key].len(), 24);
+        rename(&mut app, "  ");
+        assert!(!app.nicknames.contains_key(&key));
+    }
+
+    #[test]
+    fn rename_locks_identity_across_selection_exit_and_pid_reuse() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        let target = app.selected.unwrap();
+        app.start_rename();
+        app.rename_key(KeyCode::Char('q'));
+        app.select(1);
+        let mut next = sampler.sample(false);
+        next.sessions.retain(|s| s.key != target);
+        app.update(next);
+        app.rename_key(KeyCode::Enter);
+        assert_eq!(app.nicknames[&target], "q");
+        assert!(!app.nicknames.contains_key(&app.selected.unwrap()));
+        let mut replacement = sampler.sample(false);
+        let session = replacement
+            .sessions
+            .iter_mut()
+            .find(|s| s.key == target)
+            .unwrap();
+        session.key.started += 1;
+        assert!(!app.nicknames.contains_key(&session.key));
+        app.update(replacement);
+        app.start_rename();
+        app.rename_key(KeyCode::Char('x'));
+        app.rename_key(KeyCode::Esc);
+        assert!(app.editing_rename.is_none());
+        assert!(app.rename_text.is_empty());
+    }
+
+    #[test]
+    fn nickname_store_evicts_oldest_without_growing_forever() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        for pid in 1..=200 {
+            app.selected = Some(ProcessKey { pid, started: 1 });
+            rename(&mut app, "work");
+        }
+        assert_eq!(app.nicknames.len(), 128);
+        assert_eq!(app.nickname_order.len(), 128);
+        assert!(
+            !app.nicknames
+                .contains_key(&ProcessKey { pid: 1, started: 1 })
+        );
+        assert!(app.nicknames.contains_key(&ProcessKey {
+            pid: 200,
+            started: 1
+        }));
+    }
+
+    #[test]
+    fn changes_preserve_cursor_and_inspect_current_family_not_wrong_selection() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..14 {
+            app.update(sampler.sample(false));
+        }
+        app.open_changes();
+        let selected = app.change_selected;
+        assert!(selected.is_some());
+        for _ in 0..30 {
+            app.update(sampler.sample(false));
+        }
+        assert_eq!(app.change_selected, selected);
+        app.query = "no match".into();
+        app.changes_key(KeyCode::Enter);
+        assert!(!app.show_changes);
+        assert!(app.focused);
+        assert!(app.query.is_empty());
+        assert_eq!(app.selected.unwrap().pid, 4200);
+        app.open_changes();
+        app.changes_key(KeyCode::End);
+        assert_eq!(
+            app.change_selected,
+            app.changes.events().front().map(|e| e.sequence)
+        );
+        app.changes_key(KeyCode::Home);
+        assert_eq!(
+            app.change_selected,
+            app.changes.events().back().map(|e| e.sequence)
+        );
+    }
+
+    #[test]
+    fn pause_gap_does_not_create_a_fake_disappearance_or_growth_event() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..14 {
+            app.update(sampler.sample(false));
+        }
+        let count = app.changes.events().len();
+        app.changes.mark_gap();
+        for _ in 0..30 {
+            sampler.sample(false);
+        }
+        app.update(sampler.sample(false));
+        assert_eq!(app.changes.events().len(), count);
+    }
+
+    #[test]
+    fn stale_sample_restarts_change_baseline_without_bridging_unobserved_time() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..14 {
+            app.update(sampler.sample(false));
+        }
+        let count = app.changes.events().len();
+        for _ in 0..30 {
+            sampler.sample(false);
+        }
+        app.last_sample = Instant::now() - Duration::from_secs(60);
+        app.update(sampler.sample(false));
+        assert_eq!(app.changes.events().len(), count);
+        assert!(!app.stale());
+    }
+
+    #[test]
+    fn attached_scope_never_claims_agents_and_end_is_not_a_cause() {
+        let mut snapshot = DemoSampler::new().sample(false);
+        snapshot.attachment = Some(crate::model::AttachmentSnapshot {
+            requested_pid: 4100,
+            root: Some(snapshot.sessions[0].key),
+            status: AttachmentStatus::Attached,
+        });
+        let mut app = App::new(snapshot);
+        app.requested_all = true;
+        assert_eq!(app.scope_label(), "PID FAMILY");
+        app.snapshot.attachment.as_mut().unwrap().status = AttachmentStatus::Ended;
+        assert_eq!(app.scope_label(), "PID UNSEEN");
+        assert_eq!(app.attachment_notice(), Some("Root no longer observed"));
     }
 }

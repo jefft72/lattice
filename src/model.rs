@@ -91,6 +91,30 @@ impl SystemSnapshot {
     }
 }
 
+/// Read-only attachment state. An unavailable root never implies an exit cause.
+/// Every state except Attached is terminal for this sampler: restart explicitly
+/// to attach again. Identity inherits ProcessKey's same-second reuse limitation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentStatus {
+    Attached,
+    /// The requested PID was not observed when attachment was first attempted.
+    Missing,
+    /// Ownership/access could not be verified, initially or after attachment.
+    Unavailable,
+    /// A previously attached root is no longer observed. The cause is unknown.
+    Ended,
+    /// This PID now identifies a different process. It was not attached.
+    IdentityChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentSnapshot {
+    pub requested_pid: u32,
+    /// The initial verified identity, never replaced by a later PID occupant.
+    pub root: Option<ProcessKey>,
+    pub status: AttachmentStatus,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     /// Unix seconds, for human-readable timestamps only.
@@ -108,6 +132,8 @@ pub struct Snapshot {
     pub demo: bool,
     /// True when a safety limit prevented some owned processes being sampled.
     pub truncated: bool,
+    /// Present only for an explicit, read-only PID attachment.
+    pub attachment: Option<AttachmentSnapshot>,
 }
 
 /// Convert untrusted OS names to short, terminal-safe basenames. Restricting the
