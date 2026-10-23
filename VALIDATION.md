@@ -11,10 +11,13 @@ cargo +stable test --locked
 cargo +1.95.0 test --locked
 cargo +stable build --locked --release
 python3 tools/pty_smoke.py target/release/lattice
+python3 tools/job_control_smoke.py target/release/lattice
 python3 tools/onboarding_smoke.py target/release/lattice
 python3 tools/practical_smoke.py target/release/lattice
 python3 tools/navigation_smoke.py target/release/lattice
 python3 tools/recording_smoke.py target/release/lattice
+python3 tools/recording_io_smoke.py
+python3 tools/launcher_paths_smoke.py target/release/lattice
 python3 tools/fault_smoke.py
 ```
 
@@ -30,7 +33,9 @@ CI runs stable formatting, lint, tests, release builds, and PTY workflows on Ubu
 - Complete-prefix recovery after torn writes or abrupt termination; no silent overwrite or resume of an existing file.
 - Disk-full, file-cap and synchronization failures stop recording while preserving earlier records; OS-enforced short writes are tested without filling a disk.
 - Sampler failure and startup cancellation restore terminal state, including when recording was requested.
-- CPU baselines re-prime as unknown after gaps. A normal slower monitoring cadence is not mistaken for a gap.
+- Disposable source-level injections add four-second initialization, write, periodic-sync and final-sync stalls. Navigation remains responsive and `q`, Ctrl-C and SIGQUIT restore raw mode, alternate screen and mouse capture before waiting for pending writes.
+- Bounded-queue overflow remains visible and marks the saved prefix; stopping while starting, delayed finalization, restart, final-sync error, UI/worker panics and repeated suspend/resume cycles are exercised. Production builds contain no fault-injection environment hooks.
+- CPU baselines re-prime as unknown after gaps. A normal slower monitoring cadence is not mistaken for a gap. Recorder clock tests cover 30 monotonic seconds versus 20 wall seconds, symmetric disagreement, small negative wall deltas and the two-second tolerance.
 - Bounded parser lines/files/contributors, bounded review identities, formula-safe CSV fields, terminal-safe paths, and PID/start-time separation.
 - CSV preserves final gap counts and verified runtime, including a pause that was never resumed. Missing runtime remains unknown.
 - A worst-case row-size calculation checks 48-hour capacity at the default persistence interval. This is a bounded-size test, not a 48-hour native endurance run.

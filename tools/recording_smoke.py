@@ -232,20 +232,18 @@ def live_segregation(binary, root):
 def bad_directory(binary, root):
     root.write_text("not a directory")
     terminal = launch(binary, root, "Blocked")
+    success = False
     try:
-        terminal.process.wait(timeout=3)
-        terminal.read(0.1)
-        assert terminal.process.returncode != 0
-        assert termios.tcgetattr(terminal.slave) == terminal.original, "failed recording start leaked raw mode"
-        assert b"\x1b[?1049h" not in terminal.output, "invalid directory should fail before TUI setup"
+        terminal.read(0.3)
+        terminal.expect("RECORDING STOPPED")
+        assert terminal.process.poll() is None, "storage failure must not stop monitoring"
+        terminal.key(b"2")
+        terminal.expect("Process Map")
         assert root.read_text() == "not a directory"
+        success = True
     finally:
-        if terminal.process.poll() is None:
-            terminal.process.kill()
-            terminal.process.wait()
-        os.close(terminal.master)
-        os.close(terminal.slave)
-    print("PASS invalid storage fails before raw mode and preserves existing data")
+        terminal.close(success)
+    print("PASS invalid storage stops recording visibly, preserves data and leaves monitoring responsive")
 
 
 def main():

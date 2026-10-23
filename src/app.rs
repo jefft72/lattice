@@ -3,7 +3,7 @@ use crate::{
     explorer::Explorer,
     insights::{Insights, rss_delta},
     model::{AttachmentStatus, ProcessKey, ProcessSnapshot, SessionSnapshot, Snapshot},
-    recording::{Recorder, RecordingOptions, RecordingStatus},
+    recording::{RecordingOptions, RecordingStatus, RecordingUpdate, RecordingWorker, StopReason},
     sampling::{DemoSampler, LiveSampler},
     ui,
 };
@@ -794,46 +794,89 @@ pub struct RecordingLaunch {
     pub interval: Duration,
 }
 
-fn recording_error(app: &mut App, recorder: &mut Option<Recorder>, error: io::Error) {
-    if let Some(recording) = recorder.take() {
-        let mut status = recording.info();
+fn recording_error(app: &mut App, error: impl std::fmt::Display) {
+    if let Some(status) = &mut app.recording_status {
         status.stopped = true;
-        app.recording_status = Some(status);
     }
     let message: String = error
         .to_string()
         .chars()
         .filter(|c| !c.is_control())
-        .take(110)
+        .take(140)
         .collect();
     app.recording_notice = Some(format!("RECORDING STOPPED · {message}"));
 }
 
-fn stop_recording(app: &mut App, recorder: &mut Option<Recorder>, reason: &str) {
-    if let Some(mut recording) = recorder.take() {
-        let result = recording.finish(reason);
-        app.recording_status = Some(recording.info());
-        app.recording_notice = Some(match result {
-            Ok(()) => "Recording saved · use recordings list / show / export after quitting".into(),
-            Err(error) => format!(
-                "Recording stopped; final save failed: {}",
-                error
-                    .to_string()
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(80)
-                    .collect::<String>()
-            ),
-        });
+fn start_recording(
+    app: &mut App,
+    recorder: &mut Option<RecordingWorker>,
+    options: RecordingOptions,
+) {
+    match RecordingWorker::start(options, &app.snapshot) {
+        Ok(recording) => {
+            app.recording_status = None;
+            app.recording_notice =
+                Some("Recording starting · R stop · monitoring remains live".into());
+            *recorder = Some(recording);
+        }
+        Err(error) => recording_error(app, error),
     }
 }
 
-fn recording_gap(app: &mut App, recorder: &mut Option<Recorder>, reason: &str) {
+fn stop_recording(app: &mut App, recorder: &mut Option<RecordingWorker>, reason: StopReason) {
+    if let Some(recording) = recorder
+        && !recording.stopping()
+    {
+        recording.stop(reason);
+        app.recording_notice = Some("Recording stopping · final save pending".into());
+    }
+}
+
+fn recording_gap(app: &mut App, recorder: &mut Option<RecordingWorker>, reason: &'static str) {
     if let Some(recording) = recorder.as_mut()
         && let Err(error) = recording.mark_gap(reason)
     {
-        recording_error(app, recorder, error);
+        recording_error(app, error);
     }
+}
+
+fn apply_recording_update(
+    app: &mut App,
+    update: RecordingUpdate,
+    stopping: bool,
+) -> io::Result<()> {
+    if let Some(status) = update.status {
+        app.recording_status = Some(status);
+    }
+    if let Some(error) = update.error {
+        recording_error(app, error);
+    } else if update.finished {
+        app.recording_notice =
+            Some("Recording saved · use recordings list / show / export after quitting".into());
+    } else if !stopping {
+        app.recording_notice = None;
+    }
+    if update.panicked {
+        return Err(io::Error::other("recording worker stopped unexpectedly"));
+    }
+    Ok(())
+}
+
+fn poll_recording(app: &mut App, recorder: &mut Option<RecordingWorker>) -> io::Result<bool> {
+    let Some(recording) = recorder else {
+        return Ok(false);
+    };
+    let Some(update) = recording.poll() else {
+        return Ok(false);
+    };
+    let finished = update.finished;
+    let result = apply_recording_update(app, update, recording.stopping());
+    if finished {
+        // The final update is published only after all recording I/O ends. Drop
+        // the handle without joining; it can no longer block a restart or input.
+        *recorder = None;
+    }
+    result.map(|()| true)
 }
 
 struct TerminalGuard {
@@ -965,7 +1008,6 @@ pub fn run(
         Ok(Some(snapshot)) => snapshot,
         result => {
             stop.store(true, Ordering::Relaxed);
-
             return result.map(|_| ());
         }
     };
@@ -973,7 +1015,6 @@ pub fn run(
         && attachment.status != AttachmentStatus::Attached
     {
         stop.store(true, Ordering::Relaxed);
-
         return Err(io::Error::other(format!(
             "could not attach to PID {}: it is not an accessible current-user process in this sample. Use --all to find a PID, then try again.",
             attachment.requested_pid
@@ -983,40 +1024,36 @@ pub fn run(
     app.interval = interval;
     app.tour = tour;
     app.no_motion = no_motion;
-    let mut recorder = if let Some(name) = recording_launch.name {
-        match Recorder::start(
-            RecordingOptions {
-                name,
-                directory: recording_launch.directory.clone(),
-                interval: recording_launch.interval,
-                sampling_interval: app.interval,
-            },
-            &app.snapshot,
-        ) {
-            Ok(recording) => {
-                app.recording_status = Some(recording.info());
-                Some(recording)
-            }
-            Err(error) => {
-                stop.store(true, Ordering::Relaxed);
-
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
+    let mut recorder = None;
     let suspend = Arc::new(AtomicBool::new(false));
-    // Before this point SIGTSTP can use its default action: no terminal state has
-    // been changed, including while the first sampler read is still pending.
+    // Before terminal setup SIGTSTP can safely use the OS default action.
     guard.signals.push(signal_hook::flag::register(
         signal_hook::consts::SIGTSTP,
         suspend.clone(),
     )?);
     guard.active = true;
-    let mut terminal = ratatui::try_init()?;
-    execute!(io::stdout(), EnableMouseCapture)?;
-    let outcome = (|| -> io::Result<()> {
+    // ratatui::try_init installs a process-global restoring panic hook. A worker
+    // panic must not race terminal state; only this UI thread owns restoration.
+    // The active guard covers every partial initialization failure instead.
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut terminal =
+        ratatui::DefaultTerminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)?;
+        if let Some(name) = recording_launch.name {
+            let sampling_interval = app.interval;
+            start_recording(
+                &mut app,
+                &mut recorder,
+                RecordingOptions {
+                    name,
+                    directory: recording_launch.directory.clone(),
+                    interval: recording_launch.interval,
+                    sampling_interval,
+                },
+            );
+        }
         let mut dirty = true;
         let mut last_draw = Instant::now();
         loop {
@@ -1024,10 +1061,22 @@ pub fn run(
                 break;
             }
             if suspend.swap(false, Ordering::Relaxed) {
+                recording_gap(&mut app, &mut recorder, "terminal_suspend");
+                paused.store(true, Ordering::Release);
+                generation.fetch_add(1, Ordering::AcqRel);
+                while rx.try_recv().is_ok() {}
                 guard.suspend(&mut terminal, &stop)?;
+                // Discard any pre-suspend sample and reset CPU/change baselines.
+                generation.fetch_add(1, Ordering::AcqRel);
+                while rx.try_recv().is_ok() {}
+                paused.store(app.paused, Ordering::Release);
+                app.insights.mark_gap();
+                app.changes.mark_gap();
+                app.resuming = !app.paused;
                 dirty = true;
                 continue;
             }
+            dirty |= poll_recording(&mut app, &mut recorder)?;
             match rx.try_recv() {
                 Ok((epoch, next)) => {
                     if !app.paused && epoch == generation.load(Ordering::Acquire) {
@@ -1035,11 +1084,10 @@ pub fn run(
                             recording_gap(&mut app, &mut recorder, "sampler_delay");
                         }
                         app.update(next);
-                        if let Some(recording) = recorder.as_mut() {
-                            match recording.observe(&app.snapshot) {
-                                Ok(()) => app.recording_status = Some(recording.info()),
-                                Err(error) => recording_error(&mut app, &mut recorder, error),
-                            }
+                        if let Some(recording) = recorder.as_mut()
+                            && let Err(error) = recording.observe(&app.snapshot)
+                        {
+                            recording_error(&mut app, error);
                         }
                         dirty = true;
                     }
@@ -1055,8 +1103,11 @@ pub fn run(
                 || last_draw.elapsed() >= Duration::from_secs(1)
                 || (transitioning && last_draw.elapsed() >= TRANSITION_FRAME_INTERVAL)
             {
-                if let Some(recording) = &recorder {
-                    app.recording_status = Some(recording.info());
+                if let Some(recording) = &recorder
+                    && let Some(status) = &mut app.recording_status
+                    && !status.stopped
+                {
+                    status.elapsed_secs = recording.elapsed_secs();
                 }
                 terminal.draw(|frame| {
                     app.hitboxes = ui::draw(frame, &app);
@@ -1077,6 +1128,14 @@ pub fn run(
                             && key.code == KeyCode::Char('c')
                         {
                             break;
+                        }
+                        // Raw mode disables the terminal driver's Ctrl-Z signal.
+                        // Job control takes priority even inside a text editor.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('z')
+                        {
+                            suspend.store(true, Ordering::Relaxed);
+                            continue;
                         }
                         if app.editing_recording {
                             match key.code {
@@ -1099,24 +1158,18 @@ pub fn run(
                                                 .into(),
                                         );
                                     } else {
-                                        match Recorder::start(
+                                        let sampling_interval = app.interval;
+                                        let name = app.recording_name.trim().to_owned();
+                                        start_recording(
+                                            &mut app,
+                                            &mut recorder,
                                             RecordingOptions {
-                                                name: app.recording_name.trim().to_owned(),
+                                                name,
                                                 directory: recording_launch.directory.clone(),
                                                 interval: recording_launch.interval,
-                                                sampling_interval: app.interval,
+                                                sampling_interval,
                                             },
-                                            &app.snapshot,
-                                        ) {
-                                            Ok(recording) => {
-                                                app.recording_status = Some(recording.info());
-                                                app.recording_notice = None;
-                                                recorder = Some(recording);
-                                            }
-                                            Err(error) => {
-                                                recording_error(&mut app, &mut recorder, error)
-                                            }
-                                        }
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -1125,13 +1178,6 @@ pub fn run(
                         }
                         if app.editing_rename.is_some() {
                             app.rename_key(key.code);
-                            continue;
-                        }
-                        // Raw mode disables the terminal driver's Ctrl-Z signal.
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('z')
-                        {
-                            suspend.store(true, Ordering::Relaxed);
                             continue;
                         }
                         if app.editing_search {
@@ -1198,7 +1244,7 @@ pub fn run(
                             KeyCode::Char('r') => app.start_rename(),
                             KeyCode::Char('R') => {
                                 if recorder.is_some() {
-                                    stop_recording(&mut app, &mut recorder, "user_stop");
+                                    stop_recording(&mut app, &mut recorder, StopReason::User);
                                 } else if app.paused || app.stale() || app.resuming {
                                     app.recording_notice = Some(
                                         "Resume fresh sampling before starting a recording".into(),
@@ -1300,18 +1346,25 @@ pub fn run(
             }
         }
         Ok(())
-    })();
+    }));
     stop_recording(
         &mut app,
         &mut recorder,
-        if outcome.is_ok() {
-            "app_exit"
+        if matches!(&outcome, Ok(Ok(()))) {
+            StopReason::Exit
         } else {
-            "app_error"
+            StopReason::Error
         },
     );
     stop.store(true, Ordering::Relaxed);
     drop(guard);
+    // Filesystem stalls may delay process exit, never terminal restoration.
+    // This also runs after a UI panic; unwind resumes only after finalization.
+    let recording_outcome = if let Some(recording) = recorder.take() {
+        apply_recording_update(&mut app, recording.wait(), true)
+    } else {
+        Ok(())
+    };
     if let Some(status) = &app.recording_status {
         println!(
             "Recording {}: {}",
@@ -1336,7 +1389,10 @@ pub fn run(
     if worker.is_finished() {
         let _ = worker.join();
     }
-    outcome
+    match outcome {
+        Ok(result) => result.and(recording_outcome),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 // Keep cancellation responsive even if the first platform read stalls.

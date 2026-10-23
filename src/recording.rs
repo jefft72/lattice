@@ -10,6 +10,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -44,7 +50,71 @@ pub struct RecordingStatus {
     pub stopped: bool,
 }
 
-pub struct Recorder {
+/// The queue never retains process trees, histories, or unbounded labels. Each
+/// observation contains at most MAX_CONTRIBUTORS sanitized summaries.
+struct RecordingSample {
+    timestamp: f64,
+    monotonic: f64,
+    demo: bool,
+    all_processes: bool,
+    truncated: bool,
+    cpu: Option<f32>,
+    memory_total: u64,
+    memory_available: u64,
+    swap_used: u64,
+    scope_rss: u64,
+    families: usize,
+    contributors: Vec<RecordingContributor>,
+}
+
+struct RecordingContributor {
+    key: ProcessKey,
+    name: String,
+    rss: u64,
+    cpu: Option<f32>,
+}
+
+impl RecordingSample {
+    fn capture(snapshot: &Snapshot) -> Self {
+        let mut contributors = Vec::with_capacity(MAX_CONTRIBUTORS + 1);
+        let mut scope_rss = 0_u64;
+        for session in &snapshot.sessions {
+            let rss = session.rss_bytes();
+            scope_rss = scope_rss.saturating_add(rss);
+            let rank = contributors.partition_point(|other: &RecordingContributor| {
+                other.rss > rss || (other.rss == rss && other.key < session.key)
+            });
+            if rank < MAX_CONTRIBUTORS {
+                contributors.insert(
+                    rank,
+                    RecordingContributor {
+                        key: session.key,
+                        name: sanitize_name(&session.label),
+                        rss,
+                        cpu: session.cpu_percent(),
+                    },
+                );
+                contributors.truncate(MAX_CONTRIBUTORS);
+            }
+        }
+        Self {
+            timestamp: snapshot.timestamp,
+            monotonic: snapshot.monotonic,
+            demo: snapshot.demo,
+            all_processes: snapshot.all_processes,
+            truncated: snapshot.truncated,
+            cpu: snapshot.system.cpu_percent,
+            memory_total: snapshot.system.memory_total,
+            memory_available: snapshot.system.memory_available,
+            swap_used: snapshot.system.swap_used,
+            scope_rss,
+            families: snapshot.sessions.len(),
+            contributors,
+        }
+    }
+}
+
+struct Recorder {
     file: File,
     status: RecordingStatus,
     interval: Duration,
@@ -155,7 +225,16 @@ fn cpu_text(value: Option<f32>) -> String {
 }
 
 impl Recorder {
-    pub fn start(options: RecordingOptions, snapshot: &Snapshot) -> io::Result<Self> {
+    #[cfg(test)]
+    fn start(options: RecordingOptions, snapshot: &Snapshot) -> io::Result<Self> {
+        Self::start_sample(options, &RecordingSample::capture(snapshot), Instant::now())
+    }
+
+    fn start_sample(
+        options: RecordingOptions,
+        snapshot: &RecordingSample,
+        started: Instant,
+    ) -> io::Result<Self> {
         let name = validate_name(&options.name)?;
         if options.interval < Duration::from_secs(1) || options.interval > Duration::from_secs(3600)
         {
@@ -196,7 +275,6 @@ impl Recorder {
         }
         let (path, file) =
             selected.ok_or_else(|| io::Error::other("Could not create a unique recording file"))?;
-        let started = Instant::now();
         let mut recorder = Self {
             file,
             status: RecordingStatus {
@@ -229,7 +307,7 @@ impl Recorder {
         );
         recorder.append(&header)?;
         recorder.file.sync_data()?;
-        recorder.observe(snapshot)?;
+        recorder.observe_sample(snapshot)?;
         Ok(recorder)
     }
 
@@ -272,7 +350,12 @@ impl Recorder {
         Ok(())
     }
 
-    pub fn observe(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+    #[cfg(test)]
+    fn observe(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        self.observe_sample(&RecordingSample::capture(snapshot))
+    }
+
+    fn observe_sample(&mut self, snapshot: &RecordingSample) -> io::Result<()> {
         if self.status.stopped {
             return Ok(());
         }
@@ -312,42 +395,24 @@ impl Recorder {
         {
             return Ok(());
         }
-        // Keep at most 32 contributors, even if the input contains thousands of
-        // families. Compute RSS only once per family; no cloned process lists.
-        let mut contributors = Vec::with_capacity(MAX_CONTRIBUTORS + 1);
-        let mut scope_rss = 0_u64;
-        for session in &snapshot.sessions {
-            let rss = session.rss_bytes();
-            scope_rss = scope_rss.saturating_add(rss);
-            let rank = contributors.partition_point(
-                |(other, other_rss): &(&crate::model::SessionSnapshot, u64)| {
-                    *other_rss > rss || (*other_rss == rss && other.key < session.key)
-                },
-            );
-            if rank < MAX_CONTRIBUTORS {
-                contributors.insert(rank, (session, rss));
-                contributors.truncate(MAX_CONTRIBUTORS);
-            }
-        }
-        let omitted = snapshot.sessions.len().saturating_sub(contributors.len());
+        let scope_rss = snapshot.scope_rss;
+        let omitted = snapshot
+            .families
+            .saturating_sub(snapshot.contributors.len());
         let mut line = format!(
             "S\t{}\t{:.3}\t{elapsed:.3}\t{}\t{}\t{}\t{}\t{}\t{scope_rss}\t{}\t{omitted}\t{}\t{}\t",
             self.status.samples + 1,
             snapshot.timestamp,
             u8::from(self.pending_gap),
-            cpu_text(if self.pending_gap {
-                None
-            } else {
-                snapshot.system.cpu_percent
-            }),
-            snapshot.system.memory_total,
-            snapshot.system.memory_available,
-            snapshot.system.swap_used,
-            snapshot.sessions.len(),
+            cpu_text(if self.pending_gap { None } else { snapshot.cpu }),
+            snapshot.memory_total,
+            snapshot.memory_available,
+            snapshot.swap_used,
+            snapshot.families,
             u8::from(snapshot.truncated),
             u8::from(snapshot.all_processes)
         );
-        for (index, (session, rss)) in contributors.iter().enumerate() {
+        for (index, contributor) in snapshot.contributors.iter().enumerate() {
             if index > 0 {
                 line.push(';');
             }
@@ -356,14 +421,14 @@ impl Recorder {
             let _ = write!(
                 line,
                 "{},{},{},{},{}",
-                session.key.pid,
-                session.key.started,
-                sanitize_name(&session.label),
-                rss,
+                contributor.key.pid,
+                contributor.key.started,
+                contributor.name,
+                contributor.rss,
                 cpu_text(if self.pending_gap {
                     None
                 } else {
-                    session.cpu_percent()
+                    contributor.cpu
                 })
             );
         }
@@ -386,17 +451,289 @@ impl Recorder {
         Ok(())
     }
 
-    pub fn finish(&mut self, reason: &str) -> io::Result<()> {
+    #[cfg(test)]
+    fn finish(&mut self, reason: &str) -> io::Result<()> {
+        self.finish_at(reason, self.started.elapsed().as_secs_f64())
+    }
+
+    fn finish_at(&mut self, reason: &str, elapsed: f64) -> io::Result<()> {
         if self.status.stopped {
             return Ok(());
         }
-        let elapsed = self.started.elapsed().as_secs_f64();
         let result = self
             .append(&format!("F\t{elapsed:.3}\t{}\n", sanitize_name(reason)))
             .and_then(|()| self.file.sync_data());
         self.status.stopped = true;
         self.status.elapsed_secs = elapsed;
         result
+    }
+}
+
+// 16 compact observations, one in flight, and one coalesced status update. The
+// producer never waits for disk I/O, a queue slot, or the status mailbox lock.
+const RECORDING_QUEUE_CAPACITY: usize = 16;
+const QUEUE_OVERFLOW: &str =
+    "Recording queue filled; recording stopped instead of silently dropping samples";
+
+enum RecordingCommand {
+    Observe(RecordingSample),
+    Gap(&'static str),
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum StopReason {
+    User = 1,
+    Exit = 2,
+    Error = 3,
+    Overflow = 4,
+}
+
+impl StopReason {
+    fn label(value: u8) -> &'static str {
+        match value {
+            1 => "user_stop",
+            2 => "app_exit",
+            4 => "queue_overflow",
+            _ => "app_error",
+        }
+    }
+}
+
+pub struct RecordingUpdate {
+    pub status: Option<RecordingStatus>,
+    pub error: Option<String>,
+    pub finished: bool,
+    pub panicked: bool,
+}
+
+/// Owns the only recorder thread. Keep this handle until finalization completes;
+/// do not start another recording while the previous one is starting/stopping.
+/// Drop is intentionally nonblocking, including during panic unwinding.
+pub struct RecordingWorker {
+    sender: Option<SyncSender<RecordingCommand>>,
+    update: Arc<Mutex<Option<RecordingUpdate>>>,
+    reason: Arc<AtomicU8>,
+    worker: Option<JoinHandle<()>>,
+    started: Instant,
+    stopped_micros: Arc<AtomicU64>,
+}
+
+impl RecordingWorker {
+    pub fn start(options: RecordingOptions, snapshot: &Snapshot) -> io::Result<Self> {
+        let started = Instant::now();
+        let initial = RecordingSample::capture(snapshot);
+        let stopped_micros = Arc::new(AtomicU64::new(0));
+        let worker_stopped = stopped_micros.clone();
+        let (sender, receiver) = mpsc::sync_channel(RECORDING_QUEUE_CAPACITY);
+        let update = Arc::new(Mutex::new(None));
+        let reason = Arc::new(AtomicU8::new(StopReason::Error as u8));
+        let worker_update = update.clone();
+        let worker_reason = reason.clone();
+        let worker = thread::Builder::new()
+            .name("recording".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_recorder(
+                        options,
+                        initial,
+                        receiver,
+                        &worker_reason,
+                        &worker_update,
+                        started,
+                        &worker_stopped,
+                    )
+                }));
+                let complete = result.unwrap_or_else(|_| RecordingUpdate {
+                    status: None,
+                    error: Some(
+                        "Recording worker panicked; complete samples remain reviewable".into(),
+                    ),
+                    finished: true,
+                    panicked: true,
+                });
+                publish_update(&worker_update, complete);
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            update,
+            reason,
+            worker: Some(worker),
+            started,
+            stopped_micros,
+        })
+    }
+
+    fn send(&mut self, command: RecordingCommand) -> io::Result<()> {
+        let Some(sender) = &self.sender else {
+            return Ok(());
+        };
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.stop(StopReason::Overflow);
+                Err(io::Error::other(QUEUE_OVERFLOW))
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.sender.take();
+                Err(io::Error::other(
+                    "Recording worker stopped; awaiting final status",
+                ))
+            }
+        }
+    }
+
+    pub fn observe(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        // Do not repeatedly summarize large snapshots while stopping.
+        if self.sender.is_none() {
+            return Ok(());
+        }
+        self.send(RecordingCommand::Observe(RecordingSample::capture(
+            snapshot,
+        )))
+    }
+
+    pub fn mark_gap(&mut self, reason: &'static str) -> io::Result<()> {
+        self.send(RecordingCommand::Gap(reason))
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.sender.is_none()
+    }
+
+    pub fn elapsed_secs(&self) -> f64 {
+        match self.stopped_micros.load(Ordering::Acquire) {
+            0 => self.started.elapsed().as_secs_f64(),
+            micros => micros.saturating_sub(1) as f64 / 1_000_000.0,
+        }
+    }
+
+    pub fn stop(&mut self, reason: StopReason) {
+        if self.sender.is_some() {
+            // Closing the queue cannot fail or block even when full. The worker
+            // drains every accepted command before the footer; the first stop
+            // reason stays sticky, especially overflow followed by app exit.
+            let micros = self
+                .started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX - 1)) as u64;
+            self.stopped_micros.store(micros + 1, Ordering::Release);
+            self.reason.store(reason as u8, Ordering::Release);
+            self.sender.take();
+        }
+    }
+
+    pub fn poll(&self) -> Option<RecordingUpdate> {
+        self.update.try_lock().ok()?.take()
+    }
+
+    /// Call only after terminal restoration. This is the sole blocking API.
+    pub fn wait(mut self) -> RecordingUpdate {
+        self.stop(StopReason::Error);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .unwrap_or_else(|| RecordingUpdate {
+                status: None,
+                error: Some("Recording worker ended without final status".into()),
+                finished: true,
+                panicked: true,
+            })
+    }
+}
+
+fn publish_update(mailbox: &Mutex<Option<RecordingUpdate>>, update: RecordingUpdate) {
+    let mut latest = mailbox.lock().unwrap_or_else(|error| error.into_inner());
+    // Preserve the known file path if a panic occurs after creation. No I/O or
+    // serialization occurs under this lock, and UI reads always use try_lock.
+    let status = update
+        .status
+        .or_else(|| latest.as_ref().and_then(|old| old.status.clone()));
+    *latest = Some(RecordingUpdate { status, ..update });
+}
+
+fn run_recorder(
+    options: RecordingOptions,
+    initial: RecordingSample,
+    receiver: mpsc::Receiver<RecordingCommand>,
+    reason: &AtomicU8,
+    mailbox: &Mutex<Option<RecordingUpdate>>,
+    started: Instant,
+    stopped_micros: &AtomicU64,
+) -> RecordingUpdate {
+    let mut recorder = match Recorder::start_sample(options, &initial, started) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            return RecordingUpdate {
+                status: None,
+                error: Some(error.to_string()),
+                finished: true,
+                panicked: false,
+            };
+        }
+    };
+    publish_update(
+        mailbox,
+        RecordingUpdate {
+            status: Some(recorder.info()),
+            error: None,
+            finished: false,
+            panicked: false,
+        },
+    );
+    for command in receiver {
+        let result = match command {
+            RecordingCommand::Observe(sample) => recorder.observe_sample(&sample),
+            RecordingCommand::Gap(reason) => recorder.mark_gap(reason),
+        };
+        if let Err(error) = result {
+            return RecordingUpdate {
+                status: Some(recorder.info()),
+                error: Some(error.to_string()),
+                finished: true,
+                panicked: false,
+            };
+        }
+        publish_update(
+            mailbox,
+            RecordingUpdate {
+                status: Some(recorder.info()),
+                error: None,
+                finished: false,
+                panicked: false,
+            },
+        );
+    }
+    let reason = reason.load(Ordering::Acquire);
+    let overflow = reason == StopReason::Overflow as u8;
+    let result = if overflow {
+        recorder.mark_gap("queue_overflow")
+    } else {
+        Ok(())
+    }
+    .and_then(|()| {
+        let elapsed = match stopped_micros.load(Ordering::Acquire) {
+            0 => started.elapsed().as_secs_f64(), // Unwind/drop closes the queue too.
+            micros => micros.saturating_sub(1) as f64 / 1_000_000.0,
+        };
+        recorder.finish_at(StopReason::label(reason), elapsed)
+    });
+    let error = match result {
+        Err(error) if overflow => Some(format!("{QUEUE_OVERFLOW}; final save failed: {error}")),
+        Err(error) => Some(format!("Final save failed: {error}")),
+        Ok(()) if overflow => Some(QUEUE_OVERFLOW.into()),
+        Ok(()) => None,
+    };
+    RecordingUpdate {
+        status: Some(recorder.info()),
+        error,
+        finished: true,
+        panicked: false,
     }
 }
 
@@ -1126,6 +1463,147 @@ mod tests {
                 .contains("Gap markers: 1")
         );
         assert_eq!(recorder.info().samples, 2); // A gap overrides persistence cadence.
+    }
+
+    #[test]
+    fn compact_queue_sample_retains_totals_without_process_trees_or_histories() {
+        let mut input = snapshot(0.0);
+        input.sessions = (0..100)
+            .map(|i| family(i + 1, 1000, &"x".repeat(4000), (i + 1) as u64, Some(2.0)))
+            .collect();
+        let compact = RecordingSample::capture(&input);
+        assert_eq!(compact.families, 100);
+        assert_eq!(compact.scope_rss, 5050);
+        assert_eq!(compact.contributors.len(), MAX_CONTRIBUTORS);
+        assert_eq!(compact.contributors[0].key.pid, 100);
+        assert_eq!(compact.contributors.last().unwrap().key.pid, 69);
+        assert!(
+            compact
+                .contributors
+                .iter()
+                .all(|contributor| contributor.name.len() <= 40)
+        );
+    }
+
+    fn blocked_worker() -> (RecordingWorker, mpsc::Receiver<RecordingCommand>) {
+        let (sender, receiver) = mpsc::sync_channel(RECORDING_QUEUE_CAPACITY);
+        (
+            RecordingWorker {
+                sender: Some(sender),
+                update: Arc::new(Mutex::new(None)),
+                reason: Arc::new(AtomicU8::new(StopReason::Error as u8)),
+                worker: None,
+                started: Instant::now(),
+                stopped_micros: Arc::new(AtomicU64::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn queue_overflow_is_bounded_sticky_and_marks_the_saved_prefix() {
+        let temp = Temp::new();
+        let (mut worker, receiver) = blocked_worker();
+        for at in 1..=RECORDING_QUEUE_CAPACITY {
+            worker.observe(&snapshot(at as f64 * 5.0)).unwrap();
+        }
+        assert!(
+            worker
+                .observe(&snapshot(100.0))
+                .unwrap_err()
+                .to_string()
+                .contains("queue filled")
+        );
+        assert!(worker.stopping());
+        worker.stop(StopReason::Exit);
+        assert_eq!(
+            worker.reason.load(Ordering::Acquire),
+            StopReason::Overflow as u8
+        );
+        let result = run_recorder(
+            temp.options("bounded-prefix"),
+            RecordingSample::capture(&snapshot(0.0)),
+            receiver,
+            &worker.reason,
+            &worker.update,
+            worker.started,
+            &worker.stopped_micros,
+        );
+        assert!(result.finished);
+        assert!(result.error.unwrap().contains("queue filled"));
+        let status = result.status.unwrap();
+        assert_eq!(status.samples, RECORDING_QUEUE_CAPACITY as u64 + 1);
+        let source = fs::read_to_string(status.path).unwrap();
+        assert!(source.contains("\tqueue_overflow\n"));
+        assert!(source.lines().last().unwrap().ends_with("\tqueue_overflow"));
+    }
+
+    #[test]
+    fn full_queue_stop_and_busy_mailbox_never_wait_on_the_consumer() {
+        let (mut worker, receiver) = blocked_worker();
+        for _ in 0..RECORDING_QUEUE_CAPACITY {
+            worker.mark_gap("pause").unwrap();
+        }
+        let mailbox = worker.update.clone();
+        let _lock = mailbox.lock().unwrap();
+        let started = Instant::now();
+        assert!(worker.poll().is_none());
+        worker.stop(StopReason::User);
+        worker.stop(StopReason::Exit);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            worker.reason.load(Ordering::Acquire),
+            StopReason::User as u8
+        );
+        assert_eq!(receiver.into_iter().count(), RECORDING_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn elapsed_display_ticks_without_worker_updates_and_freezes_at_stop() {
+        let (mut worker, _receiver) = blocked_worker();
+        worker.started = Instant::now() - Duration::from_secs(30);
+        assert!(worker.elapsed_secs() >= 30.0);
+        worker.stop(StopReason::User);
+        let stopped = worker.elapsed_secs();
+        worker.started = Instant::now() - Duration::from_secs(100);
+        assert_eq!(worker.elapsed_secs(), stopped);
+    }
+
+    #[test]
+    fn stop_while_starting_waits_only_when_explicitly_requested() {
+        let temp = Temp::new();
+        let mut worker =
+            RecordingWorker::start(temp.options("immediate-stop"), &snapshot(0.0)).unwrap();
+        worker.stop(StopReason::User);
+        let result = worker.wait();
+        assert!(result.finished);
+        assert!(result.error.is_none());
+        let status = result.status.unwrap();
+        assert!(status.stopped);
+        assert!(
+            fs::read_to_string(status.path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("\tuser_stop")
+        );
+    }
+
+    #[test]
+    fn asynchronous_start_failure_is_a_terminal_error_not_success() {
+        let temp = Temp::new();
+        let path = temp.0.join("not-a-directory");
+        fs::write(&path, b"keep").unwrap();
+        let mut options = temp.options("failed-start");
+        options.directory = Some(path.clone());
+        let result = RecordingWorker::start(options, &snapshot(0.0))
+            .unwrap()
+            .wait();
+        assert!(result.finished);
+        assert!(result.error.is_some());
+        assert!(result.status.is_none());
+        assert_eq!(fs::read(path).unwrap(), b"keep");
     }
 
     #[test]
