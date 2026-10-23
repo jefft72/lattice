@@ -30,5 +30,7 @@ jobs:
         run: cargo +stable build --locked --release
       - name: Terminal lifecycle
         run: python3 tools/pty_smoke.py target/release/lattice
+      - name: Shell job control
+        run: python3 tools/job_control_smoke.py target/release/lattice
       - name: Failure-path cleanup
         run: python3 tools/fault_smoke.py

@@ -85,7 +85,8 @@ def main():
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     for name, stop in [("q", b"q"), ("Ctrl-C key", b"\x03"), ("SIGINT", signal.SIGINT),
-                       ("SIGTERM", signal.SIGTERM), ("SIGHUP", signal.SIGHUP)]:
+                       ("SIGTERM", signal.SIGTERM), ("SIGHUP", signal.SIGHUP),
+                       ("SIGQUIT", signal.SIGQUIT)]:
         run_case(binary, name, stop)
     run_case(binary, "live all-families", b"q", live=True)
 
