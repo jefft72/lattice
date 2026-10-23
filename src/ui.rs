@@ -824,10 +824,9 @@ fn overview(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect
         let y = start_y + i as u16 * row_h;
         let active = Some(session.key) == app.selected;
         if active {
-            s.fill(
-                Rect::new(area.x, y, area.width, row_h.min(area.bottom() - y)),
-                SELECT,
-            );
+            // Highlight the actual text baseline, not the spacing reserved
+            // between families. Keep the larger row hitbox for easy selection.
+            s.fill(Rect::new(area.x, y, area.width, 1), SELECT);
         }
         let identity = format!(" #{}", session.key.pid);
         let tail = if wide {
@@ -3201,6 +3200,94 @@ mod recording_dashboard_tests {
             let text = render(&app, width, height);
             if width >= 7 && height < 7 {
                 assert!(text.contains("^C quit"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod overview_selection_alignment_tests {
+    use super::*;
+    use crate::sampling::DemoSampler;
+
+    fn text_from(buffer: &Buffer, x: u16, y: u16, width: u16) -> String {
+        (x..x + width)
+            .map(|column| buffer[(column, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn selected_overview_highlight_shares_the_name_and_metric_baseline() {
+        for (width, height, expected_hit_height) in [
+            (144, 44, 3),
+            (120, 36, 2),
+            (80, 28, 2),
+            (80, 24, 1),
+            (58, 19, 1),
+            (40, 16, 1),
+        ] {
+            let mut app = App::new(DemoSampler::new().sample(false));
+            for _ in 0..4 {
+                let area = Rect::new(0, 0, width, height);
+                let mut buffer = Buffer::empty(area);
+                let mut hits = Vec::new();
+                Dashboard {
+                    app: &app,
+                    hitboxes: &mut hits,
+                }
+                .render(area, &mut buffer);
+                let session = app.selected_session().unwrap();
+                let row = hits
+                    .iter()
+                    .find_map(|(rect, target)| match target {
+                        HitTarget::Session(key) if *key == session.key => Some(*rect),
+                        _ => None,
+                    })
+                    .expect("selected family must remain visible");
+                assert_eq!(
+                    row.height, expected_hit_height,
+                    "hitbox spacing changed at {width}x{height}"
+                );
+                let text = text_from(&buffer, row.x, row.y, row.width);
+                assert!(
+                    text.contains(app.display_label(session)),
+                    "session name not on highlight: {text}"
+                );
+                assert!(
+                    text.contains(&format!("#{}", session.key.pid)),
+                    "name/PID not on highlight: {text}"
+                );
+                assert!(
+                    text.contains(&bytes(session.rss_bytes())),
+                    "RAM not on highlight: {text}"
+                );
+                if row.width >= 66 {
+                    assert!(
+                        text_from(&buffer, row.right() - 34, row.y, 14)
+                            .starts_with(&bytes(session.rss_bytes()))
+                    );
+                    assert!(
+                        text_from(&buffer, row.right() - 20, row.y, 11)
+                            .starts_with(&cpu(session.cpu_percent()))
+                    );
+                    assert!(
+                        text_from(&buffer, row.right() - 9, row.y, 9)
+                            .starts_with(&session.process_count().to_string())
+                    );
+                }
+                for y in row.y..row.bottom() {
+                    for x in row.x..row.right() {
+                        assert_eq!(
+                            buffer[(x, y)].bg,
+                            if y == row.y { SELECT } else { BG },
+                            "selection must cover exactly the text line at {width}x{height}, cell {x},{y}"
+                        );
+                    }
+                }
+                // The padded click target still selects the same family; keyboard
+                // selection and scrolling must preserve the baseline invariant.
+                assert!(row.contains((row.x, row.bottom() - 1).into()));
+                app.select(1);
             }
         }
     }
