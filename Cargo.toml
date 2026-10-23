@@ -1,0 +1,23 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A constellation of your coding sessions. A little more headroom."
+readme = "README.md"
+keywords = ["tui", "monitor", "process", "coding-agents", "terminal"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+signal-hook = "0.3"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
