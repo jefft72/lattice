@@ -1553,4 +1553,22 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_failure_stops_all_further_recording() {
+        let temp = Temp::new();
+        let mut recorder = Recorder::start(temp.options("Sync failure"), &snapshot(0.0)).unwrap();
+        let original = recorder.info().path;
+        // /dev/null accepts write/flush, but sync_data is invalid on Linux. This
+        // covers the separate durability failure after a successful write.
+        recorder.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        recorder.last_sync = Instant::now() - Duration::from_secs(31);
+        let error = recorder.observe(&snapshot(5.0)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(recorder.info().stopped);
+        assert_eq!(recorder.info().samples, 1);
+        recorder.observe(&snapshot(10.0)).unwrap();
+        assert!(review(&original).unwrap().contains("Recorded samples: 1"));
+    }
 }

@@ -17,12 +17,15 @@ from pathlib import Path
 from pty_smoke import drain
 
 
-def check(binary, paused=False, startup=False):
+def check(binary, paused=False, startup=False, recording=False):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 44, 144, 0, 0))
+    recording_directory = tempfile.TemporaryDirectory(prefix="lattice-fault-recording-")
+    recording_root = Path(recording_directory.name)
+    extra = ["--record", "Fault test", "--record-dir", str(recording_root)] if recording else []
     process = subprocess.Popen(
-        [str(binary), "--demo", "--interval", "0.5"], stdin=slave, stdout=slave, stderr=slave,
+        [str(binary), "--demo", "--interval", "0.5", *extra], stdin=slave, stdout=slave, stderr=slave,
         env={**os.environ, "TERM": "xterm-256color"},
     )
     try:
@@ -42,13 +45,23 @@ def check(binary, paused=False, startup=False):
             assert b"\x1b[?1049l" in output, "alternate screen not restored"
             assert b"\x1b[?1000l" in output, "mouse capture not restored"
         assert termios.tcgetattr(slave) == before, "terminal flags not restored"
-        print(f"PASS {'startup cancellation' if startup else 'paused sampler panic' if paused else 'sampler panic'}")
+        if recording:
+            files = list(recording_root.rglob("*.lattice"))
+            if startup:
+                assert not files, "cancellation before initial sample created a recording"
+            else:
+                assert len(files) == 1, files
+                data = files[0].read_text()
+                assert data.splitlines()[-1].endswith("\tapp_error"), data
+                assert data.splitlines()[-1].startswith("F\t"), "sampler failure did not finalize recording"
+        print(f"PASS {'startup cancellation' if startup else 'paused sampler panic' if paused else 'sampler panic'}{' with opt-in recording' if recording else ''}")
     finally:
         if process.poll() is None:
             process.kill()  # Only this script's disposable child.
             process.wait()
         os.close(master)
         os.close(slave)
+        recording_directory.cleanup()
 
 
 def main():
@@ -74,8 +87,11 @@ def main():
             if index == 0:
                 check(binary)
                 check(binary, paused=True)
+                check(binary, recording=True)
+                check(binary, paused=True, recording=True)
             else:
                 check(binary, startup=True)
+                check(binary, startup=True, recording=True)
 
 
 if __name__ == "__main__":
