@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::{
@@ -35,9 +35,19 @@ struct Fixture {
 
 impl Fixture {
     fn new(cargo: Option<&str>, rustc: Option<&str>) -> Self {
+        Self::new_with_temp_root(cargo, rustc, false)
+    }
+
+    fn new_with_temp_root(
+        cargo: Option<&str>,
+        rustc: Option<&str>,
+        symlink_temp_root: bool,
+    ) -> Self {
+        // The lock protects serialization, not shared state. Each fixture owns
+        // its files, so an earlier assertion failure must not fail later tests.
         let isolation = FIXTURE_LOCK
             .lock()
-            .expect("fixture synchronization poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -47,9 +57,18 @@ impl Fixture {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let project = root.join("checkout with spaces");
-        let bin = root.join("fake tools");
-        let home = root.join("home");
+        let temp_root = if symlink_temp_root {
+            let physical = root.join("physical temporary root");
+            fs::create_dir_all(&physical).unwrap();
+            let alias = root.join("aliased temporary root");
+            symlink(&physical, &alias).unwrap();
+            alias
+        } else {
+            root.clone()
+        };
+        let project = temp_root.join("checkout with spaces");
+        let bin = temp_root.join("fake tools");
+        let home = temp_root.join("home");
         let cargo_home = home.join(".cargo");
         let rustup_home = home.join(".rustup");
         for directory in [&project, &bin, &cargo_home, &rustup_home] {
@@ -110,7 +129,7 @@ exit "${{TEST_CARGO_EXIT:-0}}"
         }
         Self {
             _isolation: isolation,
-            capture: root.join("capture"),
+            capture: temp_root.join("capture"),
             root,
             project,
             bin,
@@ -270,7 +289,10 @@ fn spaces_arguments_and_environment_are_preserved_exactly() {
     );
     assert!(output.stdout.is_empty());
     let captured = fixture.captured();
-    assert_eq!(Path::new(&captured[0]), fixture.project);
+    assert_eq!(
+        Path::new(&captured[0]),
+        fixture.project.canonicalize().unwrap()
+    );
     assert_eq!(OsStr::new(&captured[1]), fixture.bin.as_os_str());
     assert_eq!(Path::new(&captured[2]), fixture.home);
     assert_eq!(Path::new(&captured[3]), fixture.cargo_home);
@@ -285,6 +307,33 @@ fn spaces_arguments_and_environment_are_preserved_exactly() {
         after, before,
         "launcher must not rewrite shell or toolchain configuration"
     );
+}
+
+#[test]
+fn symlinked_temporary_root_is_resolved_without_rewriting_environment() {
+    let fixture = Fixture::new_with_temp_root(
+        Some("cargo 1.95.0 (fixture)"),
+        Some("rustc 1.95.0 (fixture)"),
+        true,
+    );
+    let canonical_project = fixture.project.canonicalize().unwrap();
+    // Reproduce macOS /var -> /private/var aliases on every Unix platform.
+    assert_ne!(fixture.project, canonical_project);
+    let output = fixture.command().arg("--doctor").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = fixture.captured();
+    assert_eq!(Path::new(&captured[0]), canonical_project);
+    // Only the working directory is physical; caller-provided environment paths
+    // must retain their original spelling, even when they contain a symlink.
+    assert_eq!(OsStr::new(&captured[1]), fixture.bin.as_os_str());
+    assert_eq!(Path::new(&captured[2]), fixture.home);
+    assert_eq!(Path::new(&captured[3]), fixture.cargo_home);
+    assert_eq!(Path::new(&captured[4]), fixture.rustup_home);
+    assert_eq!(captured.last().unwrap(), "--doctor");
 }
 
 #[test]
@@ -342,7 +391,10 @@ fn relative_launcher_path_resolves_its_own_checkout() {
         relative
     };
     assert!(command.arg("--help").output().unwrap().status.success());
-    assert_eq!(Path::new(&fixture.captured()[0]), fixture.project);
+    assert_eq!(
+        Path::new(&fixture.captured()[0]),
+        fixture.project.canonicalize().unwrap()
+    );
 }
 
 #[test]
@@ -384,7 +436,10 @@ fn launcher_found_on_path_uses_the_checkout_not_the_callers_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let captured = fixture.captured();
-    assert_eq!(Path::new(&captured[0]), fixture.project);
+    assert_eq!(
+        Path::new(&captured[0]),
+        fixture.project.canonicalize().unwrap()
+    );
     assert_eq!(OsStr::new(&captured[1]), path);
     assert_eq!(captured.last().unwrap(), "--doctor");
 }
