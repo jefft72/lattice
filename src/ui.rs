@@ -1,6 +1,7 @@
 //! One terminal-cell renderer powers the live UI, tests, and deterministic SVG exports.
 use crate::{
     app::{App, Focus, Sort},
+    changes::{ChangeKind, ContributorStatus},
     insights::HeadroomLevel,
     model::{ProcessKey, SessionSnapshot},
 };
@@ -84,7 +85,7 @@ impl Surface<'_> {
             for x in rect.x..rect.right().min(self.area.width) {
                 self.buf[(x, y)]
                     .set_char(' ')
-                    .set_style(Style::default().bg(bg));
+                    .set_style(Style::reset().bg(bg));
             }
         }
     }
@@ -130,7 +131,7 @@ impl Widget for Dashboard<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         buf.set_style(area, Style::default().bg(BG).fg(TEXT));
         let mut s = Surface { buf, area };
-        if area.width < 58 || area.height < 19 {
+        if area.width < 72 || area.height < 22 {
             compact(&mut s, self.app, self.hitboxes);
             return;
         }
@@ -171,17 +172,21 @@ impl Widget for Dashboard<'_> {
         } else if app.paused {
             "Ⅱ PAUSED"
         } else if app.snapshot.demo {
-            "◌ DEMO"
+            "DEMO"
         } else {
-            "● LIVE"
+            "LIVE"
         };
         s.bold(
             width.saturating_sub(25),
             1,
-            mode,
+            if matches!(mode, "DEMO" | "LIVE") {
+                format!("{} {mode}", app.sample_marker())
+            } else {
+                mode.to_string()
+            },
             if app.paused { PEACH } else { MINT },
         );
-        s.text(width.saturating_sub(14), 1, "v0.1.0", DIM);
+        s.text(width.saturating_sub(14), 1, app.scope_label(), DIM);
         s.rule(3, 3, width - 6);
         metrics(&mut s, app);
         let footer_y = height - 2;
@@ -219,7 +224,7 @@ impl Widget for Dashboard<'_> {
         };
         s.bold(map_x, body_y - 1, map_title, DIM);
         if width >= 132 {
-            s.text(width - 30, body_y - 1, "lines = parent → child", FAINT);
+            s.text(width - 30, body_y - 1, "lines = parent → child", DIM);
         }
         session_list(
             &mut s,
@@ -244,24 +249,34 @@ impl Widget for Dashboard<'_> {
             s.text(
                 3,
                 footer_y,
-                if app.focused { "↑↓ navigate   ←→ fold   tab pane   / find   space pause   esc back   ? help" } else { "↑↓ select   ↵ inspect   / find   * pin   s sort   a scope   space pause   ? help" },
+                (if app.focused { "↑↓ move  ←→ fold  tab pane  r name  e changes  / find  a scope  esc back  ? help  q quit" } else { "↑↓ select  ↵ inspect  / find  * pin  r name  e changes  s sort  a scope  ? help  q quit" }).replace("a scope", if app.snapshot.attachment.is_some() { "PID lock" } else { "a scope" }),
                 DIM,
             );
-            s.text(width - 23, footer_y, "LOCAL · READ ONLY", MINT);
+            if width >= 132 {
+                s.text(width - 23, footer_y, "LOCAL · READ ONLY", MINT);
+            }
         } else {
             s.text(
                 3,
                 footer_y,
-                if app.focused {
-                    "↑↓ move  ←→ fold  tab pane  esc back  ? help  q quit"
+                if width < 72 {
+                    "↑↓ move  ↵ inspect  a scope  ? help  q quit"
+                } else if app.focused {
+                    "↑↓ move  ←→ fold  tab pane  r name  e changes  ? help  q quit"
                 } else {
-                    "↑↓ select  ↵ inspect  / find  * pin  s sort  ? help  q quit"
+                    "↑↓ select  ↵ inspect  r name  e changes  ? help  q quit"
                 },
                 DIM,
             );
         }
-        if app.help {
-            help(&mut s);
+        if app.help || app.tour {
+            guide(&mut s, app);
+        }
+        if app.show_changes {
+            changes_view(&mut s, app);
+        }
+        if app.editing_rename.is_some() {
+            rename_view(&mut s, app);
         }
     }
 }
@@ -274,7 +289,9 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
         s.text(
             w - 13,
             0,
-            if app.stale() {
+            if app.resuming {
+                "SYNCING"
+            } else if app.stale() {
                 "STALE"
             } else if app.paused {
                 "PAUSED"
@@ -304,7 +321,11 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
             2,
             format!(
                 "{} available · CPU {}",
-                bytes(app.snapshot.system.memory_available),
+                if app.snapshot.system.memory_total == 0 {
+                    "unknown".into()
+                } else {
+                    bytes(app.snapshot.system.memory_available)
+                },
                 cpu(app.snapshot.system.cpu_percent)
             ),
             TEXT,
@@ -315,6 +336,8 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
             s.text(1, 3, "Sampler stopped. Values are stale.", RED);
         } else if app.stale() {
             s.text(1, 3, "Waiting for sampler. Data stale.", PEACH);
+        } else if let Some(notice) = app.attachment_notice() {
+            s.text(1, 3, notice, PEACH);
         } else if app.snapshot.truncated {
             s.text(1, 3, "Scan limit reached. Partial data.", PEACH);
         } else if app.insights.headroom().level == HeadroomLevel::Critical {
@@ -323,35 +346,28 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
     }
     if h > 5 {
         if app.focused {
+            let identity = app
+                .selected
+                .map(|key| {
+                    format!(
+                        " · {}#{}",
+                        if app.pins.contains(&key) { "*" } else { "" },
+                        key.pid
+                    )
+                })
+                .unwrap_or_default();
+            s.text(1, 4, format!("{}{identity}", app.scope_label()), DIM);
             process_table(
                 s,
                 app,
-                Rect::new(1, 4, w.saturating_sub(2), h.saturating_sub(6)),
+                Rect::new(1, 5, w.saturating_sub(2), h.saturating_sub(8)),
                 hitboxes,
             );
         } else {
-            s.text(
-                1,
-                4,
-                if app.snapshot.all_processes {
-                    "ALL FAMILIES · RSS"
-                } else {
-                    "AGENT SESSIONS · RSS"
-                },
-                DIM,
-            );
+            s.text(1, 4, format!("{} · RSS", app.scope_label()), DIM);
             let list = app.sessions();
             if list.is_empty() {
-                s.text(
-                    1,
-                    5,
-                    if app.query.is_empty() {
-                        "No agents found. a: all  ?: help"
-                    } else {
-                        "No matches. esc clears the filter."
-                    },
-                    DIM,
-                );
+                s.text(1, 5, empty_title(app), DIM);
             }
             let visible = h.saturating_sub(8).max(1) as usize;
             let selected_index = list
@@ -369,8 +385,21 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
                     1,
                     5 + i as u16,
                     format!(
-                        "{marker} {:<12} {}",
-                        session.label,
+                        "{marker}{} {} #{} {}",
+                        if app.pins.contains(&session.key) {
+                            "*"
+                        } else {
+                            " "
+                        },
+                        app.display_label(session)
+                            .chars()
+                            .take((w as usize).saturating_sub(
+                                bytes(session.rss_bytes()).chars().count()
+                                    + session.key.pid.to_string().len()
+                                    + 7
+                            ))
+                            .collect::<String>(),
+                        session.key.pid,
                         bytes(session.rss_bytes())
                     ),
                     color(session),
@@ -378,24 +407,29 @@ fn compact(s: &mut Surface<'_>, app: &App, hitboxes: &mut Vec<(Rect, HitTarget)>
             }
         }
     }
-    if h > 1 {
-        s.text(1, h - 1, "↑↓ select · ? help · q quit", DIM);
+    if h > 2 {
+        s.text(1, h - 2, "↵ inspect  r name  e changes", DIM);
     }
-    if app.help {
-        s.fill(Rect::new(0, 1, w, h.saturating_sub(2)), PANEL);
-        for (i, line) in [
-            "j/k: select  Enter: focus",
-            "a: all  s: sort  Space: pause",
-            "?: close  q: quit",
-            "RSS may count shared pages twice.",
-            app.snapshot.system.pressure_label(),
-            "No process control or telemetry.",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            s.text(1, 2 + i as u16, line, DIM);
-        }
+    if h > 1 {
+        s.text(
+            1,
+            h - 1,
+            if app.snapshot.attachment.is_some() {
+                "↑↓ move  PID locked  ? help  q quit"
+            } else {
+                "↑↓ move  a scope  ? help  q quit"
+            },
+            DIM,
+        );
+    }
+    if app.help || app.tour {
+        guide(s, app);
+    }
+    if app.show_changes {
+        changes_view(s, app);
+    }
+    if app.editing_rename.is_some() {
+        rename_view(s, app);
     }
 }
 
@@ -465,9 +499,9 @@ fn metrics(s: &mut Surface<'_>, app: &App) {
         x3,
         y,
         if w >= 30 {
-            "SESSION FOOTPRINT · RSS"
+            "SCOPE TOTAL · RSS"
         } else {
-            "SESSIONS · RSS"
+            "SCOPE · RSS"
         },
         DIM,
     );
@@ -496,6 +530,8 @@ fn metrics(s: &mut Surface<'_>, app: &App) {
         s.text(x3, y + 2, "Sampler stopped · data is stale", RED);
     } else if app.stale() {
         s.text(x3, y + 2, "Waiting for sampler · data stale", PEACH);
+    } else if let Some(notice) = app.attachment_notice() {
+        s.text(x3, y + 2, notice, PEACH);
     } else if app.snapshot.truncated {
         s.text(x3, y + 2, "Scan limit reached · partial data", PEACH);
     } else if system.memory_total == 0 {
@@ -508,15 +544,12 @@ fn metrics(s: &mut Surface<'_>, app: &App) {
         s.text(x3, y + 2, "room to breathe", MINT);
     }
     if s.area.height >= 34 {
-        s.text(x1, y + 3, format!("{} · heuristic", level.label()), FAINT);
-        s.text(x2, y + 3, "system-wide · history 60 samples", FAINT);
+        s.text(x1, y + 3, format!("{} · heuristic", level.label()), DIM);
+        s.text(x2, y + 3, "system-wide · history 60 samples", DIM);
         s.text(
             x3,
             y + 3,
-            format!(
-                "swap {} · shared pages may overlap",
-                bytes(system.swap_used)
-            ),
+            format!("swap {} · total ignores search", bytes(system.swap_used)),
             FAINT,
         );
     }
@@ -525,36 +558,15 @@ fn metrics(s: &mut Surface<'_>, app: &App) {
 fn session_list(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, HitTarget)>) {
     let sessions = app.sessions();
     if sessions.is_empty() {
-        s.text(
-            area.x,
-            area.y + 1,
-            if app.query.is_empty() {
-                "Nothing in orbit. Yet."
-            } else {
-                "No matching sessions."
-            },
-            TEXT,
-        );
-        s.text(
-            area.x,
-            area.y + 3,
-            if app.query.is_empty() {
-                "Start a coding agent,"
-            } else {
-                "Try a name or PID."
-            },
-            DIM,
-        );
-        s.text(
-            area.x,
-            area.y + 4,
-            if app.query.is_empty() {
-                "or press a for all families."
-            } else {
-                "esc clears the filter."
-            },
-            DIM,
-        );
+        s.text(area.x, area.y + 1, empty_title(app), TEXT);
+        for (i, line) in wrap_line(empty_hint(app), area.width as usize)
+            .iter()
+            .enumerate()
+        {
+            if i as u16 + 3 < area.height {
+                s.text(area.x, area.y + 3 + i as u16, line, DIM);
+            }
+        }
         return;
     }
     let row_h = if area.height >= 16 { 4 } else { 3 };
@@ -578,7 +590,20 @@ fn session_list(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(
         s.bold(
             area.x + 2,
             y,
-            format!("{} {}", if active { "◉" } else { "○" }, session.label),
+            format!(
+                "{} {}",
+                if app.pins.contains(&session.key) {
+                    "*"
+                } else if active {
+                    "◉"
+                } else {
+                    "○"
+                },
+                app.display_label(session)
+                    .chars()
+                    .take(area.width.saturating_sub(15) as usize)
+                    .collect::<String>()
+            ),
             c,
         );
         s.text(
@@ -591,10 +616,14 @@ fn session_list(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(
             area.x + 4,
             y + 1,
             format!(
-                "{}  ·  {} proc",
+                "#{} · {} · {}p",
+                session.key.pid,
                 cpu(session.cpu_percent()),
                 session.process_count()
-            ),
+            )
+            .chars()
+            .take(area.width.saturating_sub(4) as usize)
+            .collect::<String>(),
             DIM,
         );
         if row_h >= 4 {
@@ -645,10 +674,14 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
         s.bold(
             area.x + 3,
             area.y + area.height / 2,
-            if app.query.is_empty() {
-                "Your next session starts here."
+            if app.attachment_notice().is_some() {
+                "Attached root not observed."
+            } else if !app.query.is_empty() {
+                "No filter matches."
+            } else if app.snapshot.all_processes {
+                "No accessible process families."
             } else {
-                "No constellations match your filter."
+                "Your next session starts here."
             },
             MINT,
         );
@@ -656,7 +689,11 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
             s.text(
                 area.x + 3,
                 area.y + area.height / 2 + 2,
-                "claude · codex · aider · opencode · goose",
+                if app.snapshot.attachment.is_some() {
+                    "No exit cause is inferred. Identity stays locked."
+                } else {
+                    "claude · codex · aider · opencode · goose"
+                },
                 DIM,
             );
         }
@@ -665,7 +702,7 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
     let focused = app.focused || s.area.width < 120 || area.height < 16;
     if focused {
         if let Some(session) = app.selected_session() {
-            constellation(s, session, area, true, hitboxes);
+            constellation(s, session, area, true, hitboxes, app.display_label(session));
         }
     } else {
         let mut shown: Vec<_> = sessions.into_iter().take(4).collect();
@@ -690,6 +727,7 @@ fn maps(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Rect, Hi
                 rect,
                 Some(session.key) == app.selected,
                 hitboxes,
+                app.display_label(session),
             );
         }
     }
@@ -707,6 +745,7 @@ fn focus_view(s: &mut Surface<'_>, app: &App, area: Rect, hitboxes: &mut Vec<(Re
             Rect::new(area.x, area.y, area.width, graph_h),
             true,
             hitboxes,
+            app.display_label(session),
         );
         process_table(
             s,
@@ -734,6 +773,15 @@ fn process_table(
         return;
     }
     let Some(session) = app.selected_session() else {
+        s.text(area.x, area.y, empty_title(app), TEXT);
+        for (i, line) in wrap_line(empty_hint(app), area.width as usize)
+            .iter()
+            .enumerate()
+        {
+            if i as u16 + 2 < area.height {
+                s.text(area.x, area.y + 2 + i as u16, line, DIM);
+            }
+        }
         return;
     };
     let rows = app.explorer.visible_rows(session);
@@ -747,7 +795,11 @@ fn process_table(
     s.bold(
         area.x,
         area.y,
-        pane,
+        if area.width < 65 {
+            format!("{pane} #{}", selected.unwrap_or(session.key).pid)
+        } else {
+            pane.into()
+        },
         if app.focus == Focus::Processes {
             c
         } else {
@@ -823,6 +875,7 @@ fn constellation(
     area: Rect,
     active: bool,
     hitboxes: &mut Vec<(Rect, HitTarget)>,
+    label: &str,
 ) {
     if area.width < 12 || area.height < 3 {
         return;
@@ -832,7 +885,7 @@ fn constellation(
     s.bold(
         area.x + 1,
         area.y,
-        format!("{} {}", if active { "◉" } else { "○" }, session.label),
+        format!("{} {}", if active { "◉" } else { "○" }, label),
         ink,
     );
     let subtitle = format!("#{} · {}", session.key.pid, bytes(session.rss_bytes()));
@@ -890,11 +943,7 @@ fn constellation(
                 },
                 if root || hot { ink } else { DIM },
             );
-            let name = if root {
-                session.label.as_str()
-            } else {
-                &process.name
-            };
+            let name = if root { label } else { &process.name };
             let next_column = positions
                 .iter()
                 .map(|(_, xx, _)| *xx)
@@ -1091,39 +1140,38 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
     let width = s.area.width;
     s.rule(3, y, width - 6);
     let Some(session) = app.selected_session() else {
-        s.text(
-            3,
-            y + 1,
-            "No recognized coding sessions. Press a to inspect other accessible families.",
-            DIM,
-        );
+        s.text(3, y + 1, empty_hint(app), DIM);
         return;
     };
     let c = color(session);
-    s.bold(
-        3,
-        y + 1,
-        format!("◉ {} / #{}", session.label, session.pid()),
-        c,
-    );
     let info = format!(
         "{} RSS   {} CPU   {} processes",
         bytes(session.rss_bytes()),
         cpu(session.cpu_percent()),
         session.process_count()
     );
-    s.text(
-        width.saturating_sub(info.len() as u16 + 3),
+    let info_x = width.saturating_sub(info.len() as u16 + 3);
+    let label_width = info_x.saturating_sub(9 + session.pid().to_string().len() as u16) as usize;
+    s.bold(
+        3,
         y + 1,
-        info,
-        TEXT,
+        format!(
+            "◉ {} / #{}",
+            app.display_label(session)
+                .chars()
+                .take(label_width)
+                .collect::<String>(),
+            session.pid()
+        ),
+        c,
     );
+    s.text(info_x, y + 1, info, TEXT);
     if height < 7 {
         s.text(
             3,
             y + 2,
-            "RSS ≠ unique RAM · CPU 100% = one core · ? for limits",
-            FAINT,
+            "RSS ≠ unique RAM · CPU 100% = one core · ? limits",
+            DIM,
         );
         return;
     }
@@ -1161,8 +1209,8 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
     s.text(
         14,
         y + 3,
-        format!("{}–{}", bytes(low as u64), bytes(high as u64)),
-        FAINT,
+        format!("{}–{} · auto", bytes(low as u64), bytes(high as u64)),
+        DIM,
     );
     let cpu_values: Vec<f64> = session
         .cpu_history
@@ -1192,12 +1240,12 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
             session.history.len()
         )
     };
-    s.text(3, y + 5, change, FAINT);
+    s.text(3, y + 5, change, DIM);
     s.text(
         half + 8,
         y + 5,
         format!("scale 0–{cpu_max:.0}% · 100% = one logical core"),
-        FAINT,
+        DIM,
     );
     s.text(
         3,
@@ -1207,99 +1255,466 @@ fn details(s: &mut Surface<'_>, app: &App, y: u16, height: u16) {
     );
 }
 
-fn help(s: &mut Surface<'_>) {
-    let w = s.area.width.min(92).saturating_sub(6);
-    let h = s.area.height.min(30).saturating_sub(4);
-    let x = (s.area.width - w) / 2;
-    let y = (s.area.height - h) / 2;
-    s.fill(Rect::new(x, y, w, h), PANEL);
-    s.bold(x + 3, y + 1, "◈ lattice / field guide", MINT);
-    s.text(x + w - 14, y + 1, "esc to close", DIM);
-    let lines = [
-        ("NAVIGATE", MINT),
-        (
-            "↑↓ / j k   Select. Enter inspects. Tab switches the active pane.",
-            TEXT,
+fn empty_title(app: &App) -> &'static str {
+    if app.attachment_notice().is_some() {
+        "Attached root not observed."
+    } else if !app.query.is_empty() {
+        "No filter matches."
+    } else if app.snapshot.all_processes {
+        "No accessible families."
+    } else {
+        "Nothing in orbit. Yet."
+    }
+}
+fn empty_hint(app: &App) -> &'static str {
+    if app.attachment_notice().is_some() {
+        "Identity is locked; no automatic reattach. The cause is unknown. Quit and choose a current --pid to start again."
+    } else if !app.query.is_empty() && app.focused {
+        "Esc returns to sessions; Esc again clears the filter. Scope totals stay unfiltered."
+    } else if !app.query.is_empty() {
+        "Search checks names and PIDs. Esc clears the filter. Scope totals stay unfiltered."
+    } else if app.snapshot.all_processes {
+        "No owned processes were accessible in this sample. Try --doctor outside the UI."
+    } else {
+        "Start Claude, Codex, or another coding agent. Press a to explore all your accessible process families."
+    }
+}
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            rows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        for ch in word.chars() {
+            if current.chars().count() == width {
+                rows.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+const GUIDE: &[(&str, Color)] = &[
+    ("MOVE THROUGH YOUR WORK", MINT),
+    (
+        "j/k or arrows select a session. Enter opens its process explorer. Tab switches the active pane.",
+        TEXT,
+    ),
+    (
+        "Left/right or h/l folds a branch. E expands all; C collapses all. Esc leaves the inspector.",
+        TEXT,
+    ),
+    (
+        "/ searches agent names, process names, and PIDs. Enter keeps the filter; Esc cancels edits or clears a saved filter.",
+        TEXT,
+    ),
+    (
+        "* pins the selected session. A visible * marks it. Pins live only for this run.",
+        TEXT,
+    ),
+    (
+        "s sorts RSS, CPU, then observed growth. a switches AGENTS and ALL FAMILIES, only for your OS user.",
+        TEXT,
+    ),
+    (
+        "Space freezes sampling and the view. A scope arrow while paused means the change is pending until resume.",
+        TEXT,
+    ),
+    (
+        "q quits except while typing a search or nickname. Ctrl-C always quits. ? or Esc closes this guide.",
+        TEXT,
+    ),
+    ("MAKE IT YOUR WORKSPACE", MINT),
+    (
+        "r names the selected session for this run. Names are bounded, terminal-safe, and tied to PID/start identity, not inherited when the start identity changes. Empty name restores the original. At most 128 names are retained.",
+        TEXT,
+    ),
+    (
+        "e opens What Changed: observed appearances, disappearances, and RSS growth between comparable samples. It is memory-only, keeps 128 events, and does not infer causes or leaks. Enter inspects a family still present.",
+        TEXT,
+    ),
+    (
+        "Growth is significant at max(32 MiB, 5% of previous family RSS) in one sample interval. Largest signed process RSS changes are contributors to the observed total, not evidence of a cause.",
+        TEXT,
+    ),
+    (
+        "./lattice --pid 12345 attaches to an existing owned process and its observed descendants, including builds or dev servers. Find its PID with --all. No commands are launched; no process is controlled.",
+        TEXT,
+    ),
+    (
+        "PID mode locks the first observed start identity and disables scope switching. If the root is no longer accessible or its identity changes, it never silently reattaches. Start times have one-second precision.",
+        TEXT,
+    ),
+    ("READ THE CONSTELLATIONS", LILAC),
+    (
+        "Lines mean parent to child, not network traffic. Each PID belongs to one session. Nested agents form separate sessions, except inside an explicit PID family.",
+        TEXT,
+    ),
+    (
+        "A filled process dot uses over 15% of a core; a hollow dot is quieter. Omitted nodes are counted, not reattached.",
+        TEXT,
+    ),
+    (
+        "The header dot changes only when a sample arrives. --no-motion keeps it static. Paused or stale data never animates.",
+        TEXT,
+    ),
+    (
+        "SCOPE TOTAL includes all sessions in the current scope, even those hidden by search. System CPU and headroom are machine-wide.",
+        TEXT,
+    ),
+    (
+        "Inspector rows are individual processes. Bottom RAM and CPU trails are totals for the selected session.",
+        TEXT,
+    ),
+    (
+        "RAM trails auto-scale: use the printed low/high values. Growth uses actual sample time; resume resets the timed window.",
+        TEXT,
+    ),
+    ("KNOW THE LIMITS", PEACH),
+    (
+        "RSS sums can count shared pages twice. They are not unique physical RAM or macOS memory footprint.",
+        TEXT,
+    ),
+    (
+        "Headroom warns at 20% available, alerts at 10%, and clears at 23% / 13%. This is a heuristic, not native macOS pressure or crash prediction.",
+        TEXT,
+    ),
+    (
+        "Process CPU 100% means one logical core. System CPU is normalized across all cores. Warming needs another sample.",
+        TEXT,
+    ),
+    (
+        "Only your user's process metrics are shown. Detection and permissions can be incomplete. PID/start identity has seconds precision.",
+        TEXT,
+    ),
+    (
+        "No process control, argument display, saved activity logs, or telemetry. The OS backend may read argument buffers transiently on macOS.",
+        MINT,
+    ),
+    ("START AGAIN", LILAC),
+    (
+        "./lattice --tour is a simulated walkthrough. ./lattice is live. ./lattice --doctor checks this machine without a terminal UI.",
+        TEXT,
+    ),
+];
+fn guide_rect(width: u16, height: u16) -> Rect {
+    let w = width.min(92).saturating_sub(4).max(1);
+    let h = height.min(34).saturating_sub(2).max(1);
+    Rect::new(
+        width.saturating_sub(w) / 2,
+        height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+fn guide_lines(width: usize) -> Vec<(String, Color)> {
+    GUIDE
+        .iter()
+        .flat_map(|(line, color)| wrap_line(line, width).into_iter().map(|row| (row, *color)))
+        .collect()
+}
+pub fn guide_scroll_limits(width: u16, height: u16) -> (usize, usize) {
+    let r = guide_rect(width, height);
+    let rows = r.height.saturating_sub(5).max(1) as usize;
+    let count = guide_lines(r.width.saturating_sub(4) as usize).len();
+    (rows, count.saturating_sub(rows))
+}
+fn tour_copy(step: usize) -> (&'static str, &'static str) {
+    match step {
+        0 => (
+            "1/3 · YOUR SESSIONS, CONNECTED",
+            "This is simulated data, not your laptop. Each constellation groups a coding agent with its child processes. Lines mean parent to child, not network traffic.",
         ),
-        (
-            "←→ / h l   Fold / expand a process branch. E / C unfolds / folds all.",
-            TEXT,
+        1 => (
+            "2/3 · FIND THE HEAVY BRANCH",
+            "Arrows select; Enter inspects. Tab switches panes. Left/right folds branches. / finds names or PIDs; * pins a session. Space pauses to inspect without chasing changing numbers.",
         ),
-        (
-            "/          Filter by agent, process name, or PID. Enter keeps, esc cancels.",
-            TEXT,
+        _ => (
+            "3/3 · READ THE NUMBERS",
+            "RSS may count shared memory twice. CPU 100% means one core. Headroom is a warning heuristic, not crash prevention. Enter explores this demo. Quit with q, then run ./lattice for LIVE data.",
         ),
-        (
-            "*          Pin this session to the top. Pins live only for this run.",
-            TEXT,
-        ),
-        (
-            "s / a      Sort RSS → CPU → growth / switch agent and all-family scope.",
-            TEXT,
-        ),
-        (
-            "space      Freeze sampling. Resume starts a fresh timed growth window.",
-            TEXT,
-        ),
-        (
-            "esc / q    Leave inspector or clear filter / quit. Ctrl-C always quits.",
-            TEXT,
-        ),
-        ("", DIM),
-        ("READ THE MAP", LILAC),
-        (
-            "◉ session root. Lines are parent → child. Hidden nodes are counted.",
-            TEXT,
-        ),
-        (
-            "● uses >15% of a core; ○ is quieter. RAM trails auto-scale.",
-            TEXT,
-        ),
-        (
-            "Inspector values are per-process; the bottom trails remain session totals.",
-            TEXT,
-        ),
-        ("", DIM),
-        ("KNOW THE LIMITS", PEACH),
-        (
-            "RSS sums may count shared pages twice. Growth is observed, not a forecast.",
-            TEXT,
-        ),
-        (
-            "Headroom warns at ≤20%, alerts at ≤10%; clears at ≥23% / ≥13%.",
-            TEXT,
-        ),
-        (
-            "This is not native macOS pressure or a prediction of an OS crash.",
-            TEXT,
-        ),
-        (
-            "CPU 100% = one logical core. First readings need another sample.",
-            TEXT,
-        ),
-        (
-            "Only your user’s process metrics are shown. Detection may be incomplete.",
-            TEXT,
-        ),
-        (
-            "No process control, argument display, saved activity logs or telemetry.",
-            MINT,
-        ),
-    ];
-    for (i, (line, c)) in lines
-        .into_iter()
-        .take(h.saturating_sub(4) as usize)
-        .enumerate()
-    {
+    }
+}
+
+fn guide(s: &mut Surface<'_>, app: &App) {
+    let mut r = guide_rect(s.area.width, s.area.height);
+    if app.tour {
+        let (_, body) = tour_copy(app.tour_step);
+        r.height = r
+            .height
+            .min(wrap_line(body, r.width.saturating_sub(4) as usize).len() as u16 + 6);
+        r.y = s.area.height.saturating_sub(r.height) / 2;
+    }
+    s.fill(r, PANEL);
+    if r.width < 8 || r.height < 5 {
+        return;
+    }
+    let width = r.width.saturating_sub(4) as usize;
+    let rows = r.height.saturating_sub(5) as usize;
+    if app.tour {
+        let (title, body) = tour_copy(app.tour_step);
+        s.bold(r.x + 2, r.y, "DEMO TOUR · simulated data", MINT);
         s.text(
-            x + 3,
-            y + 3 + i as u16,
-            line.chars()
-                .take(w.saturating_sub(6) as usize)
-                .collect::<String>(),
-            c,
+            r.x + 2,
+            r.y + 1,
+            title.chars().take(width).collect::<String>(),
+            LILAC,
+        );
+        for (i, line) in wrap_line(body, width).into_iter().take(rows).enumerate() {
+            s.text(r.x + 2, r.y + 3 + i as u16, line, TEXT);
+        }
+        s.text(r.x + 2, r.bottom() - 1, "enter next  esc skip  q quit", DIM);
+    } else {
+        let lines = guide_lines(width);
+        let start = app.help_scroll.min(lines.len().saturating_sub(rows));
+        s.bold(
+            r.x + 2,
+            r.y,
+            format!("FIELD GUIDE {}/{}", start + 1, lines.len()),
+            MINT,
+        );
+        s.text(
+            r.x + 2,
+            r.y + 1,
+            format!(
+                "{} · {}",
+                if app.focused { "INSPECTOR" } else { "SESSIONS" },
+                app.scope_label()
+            ),
+            DIM,
+        );
+        for (i, (line, color)) in lines.into_iter().skip(start).take(rows).enumerate() {
+            s.text(r.x + 2, r.y + 3 + i as u16, line, color);
+        }
+        s.text(
+            r.x + 2,
+            r.bottom() - 1,
+            "j/k scroll  esc close  q quit",
+            DIM,
         );
     }
+}
+
+fn signed_bytes(delta: i64) -> String {
+    format!(
+        "{}{}",
+        if delta >= 0 { "+" } else { "−" },
+        bytes(delta.unsigned_abs())
+    )
+}
+fn rename_view(s: &mut Surface<'_>, app: &App) {
+    let Some(key) = app.editing_rename else {
+        return;
+    };
+    let width = s.area.width.saturating_sub(4).clamp(1, 66);
+    let height = s.area.height.saturating_sub(2).clamp(1, 10);
+    let r = Rect::new(
+        s.area.width.saturating_sub(width) / 2,
+        s.area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    s.fill(r, PANEL);
+    if width < 10 || height < 5 {
+        return;
+    }
+    let inner = width.saturating_sub(4) as usize;
+    s.bold(r.x + 2, r.y, format!("NAME SESSION · #{}", key.pid), MINT);
+    s.text(r.x + 2, r.y + 1, "This run only · 24 safe characters", DIM);
+    s.bold(r.x + 2, r.y + 3, format!("{}▏", app.rename_text), TEXT);
+    let hint = "Letters, digits, spaces, . _ - +. Empty restores the original name.";
+    for (i, line) in wrap_line(hint, inner).into_iter().enumerate() {
+        if 5 + (i as u16) < height.saturating_sub(1) {
+            s.text(r.x + 2, r.y + 5 + i as u16, line, DIM);
+        }
+    }
+    s.text(
+        r.x + 2,
+        r.bottom() - 1,
+        "enter save  esc cancel  ^C quit",
+        DIM,
+    );
+}
+fn changes_view(s: &mut Surface<'_>, app: &App) {
+    let r = guide_rect(s.area.width, s.area.height);
+    s.fill(r, PANEL);
+    if r.width < 12 || r.height < 7 {
+        return;
+    }
+    let inner = r.width.saturating_sub(4);
+    let entries: Vec<_> = app.changes.events().iter().rev().collect();
+    s.bold(
+        r.x + 2,
+        r.y,
+        format!("WHAT CHANGED · {} kept", entries.len()),
+        MINT,
+    );
+    s.text(r.x + 2, r.y + 1, "Observed, not causes · memory only", DIM);
+    if entries.is_empty() {
+        let message = "No changes observed yet. The first sample primes a baseline. Growth means at least 32 MiB and 5% of previous family RSS in one sample interval. Appearances and disappearances are observations, not exit causes.";
+        for (i, line) in wrap_line(message, inner as usize).into_iter().enumerate() {
+            if i as u16 + 3 < r.height.saturating_sub(1) {
+                s.text(r.x + 2, r.y + 3 + i as u16, line, TEXT);
+            }
+        }
+        s.text(r.x + 2, r.bottom() - 1, "esc back  e close  q quit", DIM);
+        return;
+    }
+    let selected = entries
+        .iter()
+        .position(|event| Some(event.sequence) == app.change_selected)
+        .unwrap_or(0);
+    let detail_height: u16 = if r.height >= 20 { 7 } else { 6 };
+    let row_height: u16 = if inner >= 60 { 2 } else { 1 };
+    let list_height = r.height.saturating_sub(detail_height + 4);
+    let visible = (list_height / row_height).max(1) as usize;
+    let start = selected.saturating_sub(visible - 1);
+    for (offset, event) in entries.iter().skip(start).take(visible).enumerate() {
+        let y = r.y + 3 + offset as u16 * row_height;
+        let active = offset + start == selected;
+        if active {
+            s.fill(
+                Rect::new(r.x + 1, y, r.width.saturating_sub(2), row_height),
+                SELECT,
+            );
+        }
+        let label = app
+            .nicknames
+            .get(&event.session_key)
+            .map(String::as_str)
+            .unwrap_or(&event.session_name);
+        let tail = format!(
+            " #{} {}",
+            event.session_key.pid,
+            signed_bytes(event.rss_delta_bytes)
+        );
+        let name_width = (inner as usize).saturating_sub(tail.chars().count() + 2);
+        s.text(
+            r.x + 2,
+            y,
+            format!(
+                "{} {}{}",
+                if active { "›" } else { " " },
+                label.chars().take(name_width).collect::<String>(),
+                tail
+            ),
+            if active { MINT } else { TEXT },
+        );
+        if row_height == 2 {
+            let kind = match event.kind {
+                ChangeKind::Appeared => "family first seen",
+                ChangeKind::Disappeared => "family not seen",
+                ChangeKind::Changed if event.significant_growth => "RSS growth",
+                ChangeKind::Changed => "membership changed",
+            };
+            s.text(
+                r.x + 4,
+                y + 1,
+                format!(
+                    "t+{:.0}s · {kind} · +{} / −{} processes",
+                    event.monotonic, event.appeared, event.disappeared
+                )
+                .chars()
+                .take(inner.saturating_sub(2) as usize)
+                .collect::<String>(),
+                DIM,
+            );
+        }
+    }
+    let event = entries[selected];
+    let y = r.bottom().saturating_sub(detail_height + 1);
+    s.rule(r.x + 2, y, inner);
+    s.text(
+        r.x + 2,
+        y + 1,
+        format!(
+            "+{} seen / −{} not seen · RSS {}",
+            event.appeared,
+            event.disappeared,
+            signed_bytes(event.rss_delta_bytes)
+        )
+        .chars()
+        .take(inner as usize)
+        .collect::<String>(),
+        LILAC,
+    );
+    for (i, item) in event.contributors.iter().take(3).enumerate() {
+        let status = match item.status {
+            ContributorStatus::Present => "delta",
+            ContributorStatus::Appeared => "new",
+            ContributorStatus::Disappeared => "not seen",
+        };
+        let prefix = format!("{} ", signed_bytes(item.delta_bytes));
+        let suffix = format!(" #{} {status}", item.key.pid);
+        let name_width =
+            (inner as usize).saturating_sub(prefix.chars().count() + suffix.chars().count());
+        s.text(
+            r.x + 2,
+            y + 2 + i as u16,
+            format!(
+                "{}{}{}",
+                prefix,
+                item.name.chars().take(name_width).collect::<String>(),
+                suffix
+            ),
+            TEXT,
+        );
+    }
+    if detail_height >= 7 {
+        let live = app
+            .snapshot
+            .sessions
+            .iter()
+            .any(|session| session.key == event.session_key);
+        s.text(
+            r.x + 2,
+            y + 5,
+            format!(
+                "Top 3 signed RSS contributors · {}",
+                if live {
+                    "Enter inspects family"
+                } else {
+                    "family not in latest sample"
+                }
+            )
+            .chars()
+            .take(inner as usize)
+            .collect::<String>(),
+            DIM,
+        );
+        s.text(
+            r.x + 2,
+            y + 6,
+            format!(
+                "{}/{} · {} older events discarded · no disk log",
+                selected + 1,
+                entries.len(),
+                app.changes.dropped_events()
+            )
+            .chars()
+            .take(inner as usize)
+            .collect::<String>(),
+            DIM,
+        );
+    }
+    s.text(
+        r.x + 2,
+        r.bottom() - 1,
+        if inner >= 55 {
+            "↑↓ browse  enter inspect  esc back  e close  q quit"
+        } else {
+            "↑↓ move  ↵ inspect  esc  q quit"
+        },
+        DIM,
+    );
 }
 
 fn xml(value: &str) -> String {
@@ -1581,5 +1996,268 @@ mod graph_regressions {
             *rails.entry(point).or_insert(0) |= mask;
         }
         assert_eq!(edge_glyph(rails[&(5, 2)]), "┤");
+    }
+}
+
+#[cfg(test)]
+mod onboarding_regressions {
+    use super::*;
+    use crate::sampling::DemoSampler;
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        Dashboard {
+            app,
+            hitboxes: &mut Vec::new(),
+        }
+        .render(area, &mut buf);
+        buf.content
+            .chunks(w as usize)
+            .map(|line| line.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn same_name_sessions_keep_visible_pid_and_pin_identity_at_all_sizes() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        for session in &mut app.snapshot.sessions {
+            session.label = "claude".into();
+        }
+        app.toggle_pin();
+        let selected_pid = app.selected.unwrap().pid.to_string();
+        for (w, h) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            let text = render(&app, w, h);
+            assert!(
+                text.contains(&format!("#{selected_pid}")),
+                "{w}x{h}: {text}"
+            );
+            assert!(text.contains("* claude"), "{w}x{h}: {text}");
+            assert!(text.contains("AGENTS"));
+            assert!(text.contains("q quit"));
+        }
+    }
+    #[test]
+    fn empty_states_distinguish_agent_detection_access_and_filtering() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.snapshot.sessions.clear();
+        app.selected = None;
+        for (w, h) in [(40, 16), (80, 24), (144, 44)] {
+            app.snapshot.all_processes = false;
+            app.requested_all = false;
+            app.query.clear();
+            assert!(render(&app, w, h).contains("Nothing in orbit"));
+            app.snapshot.all_processes = true;
+            app.requested_all = true;
+            let all = render(&app, w, h);
+            assert!(all.contains("No accessible families"));
+            assert!(!all.contains("No agents"));
+            app.query = "missing".into();
+            let filtered = render(&app, w, h);
+            assert!(filtered.contains("No filter matches"));
+            assert!(!filtered.contains("No recognized coding"));
+        }
+    }
+    #[test]
+    fn all_help_is_reachable_and_inspector_context_is_visible() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.help = true;
+        app.focused = true;
+        for (w, h) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            app.help_scroll = 0;
+            let top = render(&app, w, h);
+            assert!(top.contains("INSPECTOR"));
+            let (rows, maximum) = guide_scroll_limits(w, h);
+            assert!(rows > 0 && maximum > 0);
+            app.help_scroll = usize::MAX;
+            let bottom = render(&app, w, h);
+            assert!(bottom.contains("--doctor"), "{w}x{h}: {bottom}");
+            assert!(bottom.contains("q quit"));
+        }
+    }
+    #[test]
+    fn tour_text_remains_complete_at_small_supported_sizes() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.tour = true;
+        for (w, h) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            for (step, last) in [
+                (0, "network traffic."),
+                (1, "changing numbers."),
+                (2, "LIVE data."),
+            ] {
+                app.tour_step = step;
+                let text = render(&app, w, h);
+                assert!(text.contains("DEMO TOUR"));
+                // Ignore terminal line wraps while checking the final text is not clipped.
+                let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(words.contains(last), "{w}x{h}: {text}");
+            }
+        }
+    }
+    #[test]
+    fn help_wraps_long_tokens_without_losing_text() {
+        assert_eq!(wrap_line("abcdefghij", 3).concat(), "abcdefghij");
+        assert!(
+            wrap_line("hello world", 4)
+                .iter()
+                .all(|s| s.chars().count() <= 4)
+        );
+    }
+}
+
+#[cfg(test)]
+mod inspector_empty_regression {
+    use super::*;
+    #[test]
+    fn filtered_empty_inspector_explains_escape_in_compact_layouts() {
+        let mut app = App::new(crate::sampling::DemoSampler::new().sample(false));
+        app.focused = true;
+        app.start_search();
+        for ch in "zz-no-match".chars() {
+            app.search_key(crossterm::event::KeyCode::Char(ch));
+        }
+        app.search_key(crossterm::event::KeyCode::Enter);
+        assert!(app.selected.is_none());
+        for (w, h) in [(40, 16), (58, 19), (80, 24), (144, 44)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buffer = Buffer::empty(area);
+            Dashboard {
+                app: &app,
+                hitboxes: &mut Vec::new(),
+            }
+            .render(area, &mut buffer);
+            let text = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("No filter matches"), "{w}x{h}: {text}");
+            if w < 72 {
+                assert!(text.contains("Esc returns to sessions"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod narrow_identity_regression {
+    use super::*;
+    #[test]
+    fn narrow_inspector_keeps_session_pin_and_selected_process_pid_visible() {
+        let mut app = App::new(crate::sampling::DemoSampler::new().sample(false));
+        app.toggle_pin();
+        app.focused = true;
+        app.focus = Focus::Processes;
+        app.move_cursor(1);
+        let pid = app.explorer.selected().unwrap().pid;
+        for (w, h) in [(40, 16), (58, 19), (80, 24)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buffer = Buffer::empty(area);
+            Dashboard {
+                app: &app,
+                hitboxes: &mut Vec::new(),
+            }
+            .render(area, &mut buffer);
+            let text = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                text.contains(&format!("PROCESS EXPLORER #{pid}")),
+                "{w}x{h}: {text}"
+            );
+            assert!(text.contains('*'));
+            assert!(text.contains("#4100"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod practical_ui_tests {
+    use super::*;
+    use crate::{
+        model::{AttachmentSnapshot, AttachmentStatus},
+        sampling::DemoSampler,
+    };
+    fn render(w: u16, h: u16, app: &App) -> String {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        Dashboard {
+            app,
+            hitboxes: &mut Vec::new(),
+        }
+        .render(area, &mut buf);
+        buf.content
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn practical_modals_preserve_identity_and_quit_cues_at_supported_sizes() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..59 {
+            app.update(sampler.sample(false));
+        }
+        for (w, h) in [(40, 16), (58, 19), (72, 22), (80, 24), (144, 44)] {
+            app.start_rename();
+            app.rename_text = "CalHacks API".into();
+            let text = render(w, h, &app);
+            assert!(text.contains("NAME SESSION · #4100"), "{w}x{h}\n{text}");
+            assert!(text.contains("CalHacks API"));
+            assert!(text.contains("^C quit"));
+            app.rename_key(crossterm::event::KeyCode::Esc);
+            app.open_changes();
+            let text = render(w, h, &app);
+            for expected in [
+                "WHAT CHANGED",
+                "Observed, not causes",
+                "vite",
+                "not seen",
+                "q quit",
+            ] {
+                assert!(text.contains(expected), "{w}x{h}: {expected}\n{text}");
+            }
+            app.show_changes = false;
+        }
+    }
+    #[test]
+    fn event_empty_state_is_actionable_and_tiny_modals_do_not_panic() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.open_changes();
+        let text = render(40, 16, &app);
+        assert!(text.contains("No changes observed yet."));
+        assert!(text.contains("q quit"));
+        for w in 1..80 {
+            for h in 1..24 {
+                app.editing_rename = None;
+                render(w, h, &app);
+                app.start_rename();
+                render(w, h, &app);
+            }
+        }
+    }
+    #[test]
+    fn attached_root_loss_is_not_presented_as_generic_agent_empty_state() {
+        let mut snapshot = DemoSampler::new().sample(false);
+        snapshot.demo = false;
+        snapshot.attachment = Some(AttachmentSnapshot {
+            requested_pid: 4100,
+            root: Some(snapshot.sessions[0].key),
+            status: AttachmentStatus::Ended,
+        });
+        snapshot.sessions.clear();
+        let app = App::new(snapshot);
+        for (w, h) in [(40, 16), (80, 24), (144, 44)] {
+            let text = render(w, h, &app);
+            assert!(text.contains("PID UNSEEN"), "{text}");
+            assert!(
+                text.contains("Root no longer observed")
+                    || text.contains("Attached root not observed"),
+                "{text}"
+            );
+            assert!(!text.contains("No agents found"), "{text}");
+        }
     }
 }

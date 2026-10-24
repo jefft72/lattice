@@ -53,3 +53,95 @@ fn demo_export_is_repeatable_and_does_not_require_a_terminal() {
     assert!(one.starts_with("<svg") && one.ends_with("</g></svg>"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn doctor_is_read_only_non_tty_and_demo_options_are_explicit() {
+    let output = binary().arg("--doctor").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "read-only diagnostics",
+        "TTY: stdin=no, stdout=no",
+        "Live sample:",
+        "Detected agent sessions:",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert!(!text.contains('\x1b'));
+    for args in [
+        ["--doctor", "--demo"],
+        ["--doctor", "--tour"],
+        ["--doctor", "--all"],
+    ] {
+        assert!(!binary().args(args).output().unwrap().status.success());
+    }
+    assert!(!binary().arg("--tour").output().unwrap().status.success());
+}
+
+#[test]
+fn quickstart_exposes_local_launch_tour_live_and_diagnostics() {
+    let output = binary().arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "./lattice --tour",
+        "./lattice --all",
+        "./lattice --doctor",
+        "--no-motion",
+        "cargo install --path . --locked",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn pid_attachment_is_positive_explicit_live_and_not_a_launcher() {
+    for args in [
+        vec!["--pid", "0"],
+        vec!["--pid", "-1"],
+        vec!["--pid", "4294967296"],
+        vec!["--pid", "123", "--demo"],
+        vec!["--pid", "123", "--tour"],
+        vec!["--pid", "123", "--doctor"],
+        vec!["--pid", "123", "--all"],
+        vec!["--pid", "123", "--", "echo"],
+        vec!["--changes"],
+    ] {
+        let output = binary().args(&args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+    }
+    let help = binary().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("./lattice --pid 12345"));
+    assert!(help.contains("never launches"));
+    assert!(help.contains("r nickname"));
+    assert!(help.contains("e changes"));
+}
+
+#[test]
+fn changes_demo_export_contains_observed_events_without_live_access() {
+    let dir = std::env::temp_dir().join(format!("lattice-changes-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("changes.svg");
+    let output = binary()
+        .args(["--demo", "--changes", "--snapshot"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let svg = fs::read_to_string(&path).unwrap();
+    let rendered: String = svg
+        .split("</text>")
+        .filter_map(|part| part.rsplit_once('>').map(|(_, text)| text))
+        .collect();
+    for text in [
+        "WHAT CHANGED",
+        "Observed, not causes",
+        "vite",
+        "not seen",
+        "no disk log",
+    ] {
+        assert!(rendered.contains(&text.replace(' ', "")), "missing {text}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
