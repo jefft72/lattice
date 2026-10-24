@@ -111,6 +111,46 @@ impl Metric {
 
 pub const VIEW_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const TRANSITION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+// Terminals report trackpad gestures as bursts of discrete wheel events. Limit
+// repeats, not input polling: the first tick/reversal stays immediate, excess
+// ticks are discarded, and nothing is queued to move after the gesture ends.
+const VERTICAL_SCROLL_INTERVAL: Duration = Duration::from_millis(90);
+const HORIZONTAL_SCROLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollTarget {
+    Views,
+    Help,
+    Sessions(View),
+    Inspector(Option<ProcessKey>),
+    Heatmap(Option<ProcessKey>),
+    Changes,
+}
+
+#[derive(Default)]
+struct ScrollThrottle {
+    last: Option<(ScrollTarget, MouseEventKind, Instant)>,
+}
+
+impl ScrollThrottle {
+    fn accept(
+        &mut self,
+        target: ScrollTarget,
+        direction: MouseEventKind,
+        now: Instant,
+        interval: Duration,
+    ) -> bool {
+        if let Some((previous_target, previous_direction, accepted_at)) = self.last
+            && target == previous_target
+            && direction == previous_direction
+            && now.saturating_duration_since(accepted_at) < interval
+        {
+            return false;
+        }
+        self.last = Some((target, direction, now));
+        true
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewTransition {
@@ -160,6 +200,8 @@ pub struct App {
     pub recording_name: String,
     pub sampler_failed: bool,
     pub resuming: bool,
+    vertical_scroll: ScrollThrottle,
+    horizontal_scroll: ScrollThrottle,
 }
 
 impl App {
@@ -209,6 +251,8 @@ impl App {
             recording_name: String::new(),
             sampler_failed: false,
             resuming: false,
+            vertical_scroll: ScrollThrottle::default(),
+            horizontal_scroll: ScrollThrottle::default(),
         };
         app.reconcile_selection();
         app
@@ -339,6 +383,74 @@ impl App {
                     self.set_view(View::ProcessMap);
                     self.focused = true;
                     self.focus = Focus::Processes;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Handle only wheel input. Keys and clicks never pass through the throttle.
+    fn scroll(&mut self, direction: MouseEventKind, now: Instant, help_maximum: usize) -> bool {
+        if self.editing_search
+            || self.editing_rename.is_some()
+            || self.editing_recording
+            || self.tour
+        {
+            return false;
+        }
+        match direction {
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if !self.help => {
+                // The deck is one target: changing the visible view must not
+                // reset the cooldown and let one swipe cycle through all views.
+                if !self.horizontal_scroll.accept(
+                    ScrollTarget::Views,
+                    direction,
+                    now,
+                    HORIZONTAL_SCROLL_INTERVAL,
+                ) {
+                    return false;
+                }
+                self.navigate_view(if direction == MouseEventKind::ScrollLeft {
+                    -1
+                } else {
+                    1
+                });
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let target = if self.help {
+                    ScrollTarget::Help
+                } else if self.view == View::Changes {
+                    ScrollTarget::Changes
+                } else if self.view == View::ProcessMap
+                    && self.focus == Focus::Processes
+                    && self.focused
+                {
+                    ScrollTarget::Inspector(self.selected)
+                } else if self.view == View::ProcessMap
+                    && self.focus == Focus::Processes
+                    && self.graph_mode == GraphMode::Heatmap
+                {
+                    ScrollTarget::Heatmap(self.selected)
+                } else {
+                    ScrollTarget::Sessions(self.view)
+                };
+                if !self
+                    .vertical_scroll
+                    .accept(target, direction, now, VERTICAL_SCROLL_INTERVAL)
+                {
+                    return false;
+                }
+                let down = direction == MouseEventKind::ScrollDown;
+                let key = if down { KeyCode::Down } else { KeyCode::Up };
+                if self.help {
+                    self.help_scroll = self.help_scroll.min(help_maximum);
+                    self.guide_key(key, 1);
+                    self.help_scroll = self.help_scroll.min(help_maximum);
+                } else if self.view == View::Changes {
+                    self.changes_key(key);
+                } else {
+                    self.move_cursor(if down { 1 } else { -1 });
                 }
             }
             _ => return false,
@@ -1290,32 +1402,17 @@ pub fn run(
                         }
                     }
                     Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                            if app.help && !app.editing_search && app.editing_rename.is_none() =>
-                        {
-                            let size = terminal.size()?;
-                            let (_, maximum) = ui::guide_scroll_limits(size.width, size.height);
-                            app.help_scroll = app.help_scroll.min(maximum);
-                            app.guide_key(
-                                if mouse.kind == MouseEventKind::ScrollDown {
-                                    KeyCode::Down
-                                } else {
-                                    KeyCode::Up
-                                },
-                                1,
-                            );
-                            app.help_scroll = app.help_scroll.min(maximum);
-                            dirty = true;
-                        }
-                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
-                            if !app.navigation_blocked() =>
-                        {
-                            app.navigate_view(if mouse.kind == MouseEventKind::ScrollLeft {
-                                -1
+                        MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight => {
+                            let maximum = if app.help {
+                                let size = terminal.size()?;
+                                ui::guide_scroll_limits(size.width, size.height).1
                             } else {
-                                1
-                            });
-                            dirty = true;
+                                0
+                            };
+                            dirty |= app.scroll(mouse.kind, Instant::now(), maximum);
                         }
                         MouseEventKind::Down(MouseButton::Left) if !app.navigation_blocked() => {
                             if let Some((_, target)) = app
@@ -1326,17 +1423,6 @@ pub fn run(
                                 app.click(*target);
                                 dirty = true;
                             }
-                        }
-                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                            if !app.navigation_blocked() =>
-                        {
-                            let down = mouse.kind == MouseEventKind::ScrollDown;
-                            if app.view == View::Changes {
-                                app.changes_key(if down { KeyCode::Down } else { KeyCode::Up });
-                            } else {
-                                app.move_cursor(if down { 1 } else { -1 });
-                            }
-                            dirty = true;
                         }
                         _ => {}
                     },
@@ -2201,5 +2287,231 @@ mod navigation_tests {
         assert!(app.transition_progress().is_none());
         assert!(app.finish_transition());
         assert!(app.transition.is_none());
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use MouseEventKind::{ScrollDown, ScrollLeft, ScrollRight, ScrollUp};
+
+    fn demo() -> App {
+        App::new(DemoSampler::new().sample(false))
+    }
+
+    #[test]
+    fn vertical_bursts_drop_excess_ticks_without_postponing_the_next_step() {
+        let mut app = demo();
+        app.help = true;
+        let start = Instant::now();
+        for milliseconds in 0..900 {
+            let accepted = app.scroll(ScrollDown, start + Duration::from_millis(milliseconds), 100);
+            assert_eq!(accepted, milliseconds % 90 == 0);
+        }
+        assert_eq!(app.help_scroll, 10);
+        // A long gap produces one fresh step, never catch-up for dropped ticks.
+        assert!(app.scroll(ScrollDown, start + Duration::from_secs(10), 100));
+        assert_eq!(app.help_scroll, 11);
+    }
+
+    #[test]
+    fn direction_reversals_and_first_ticks_are_immediate() {
+        let mut app = demo();
+        let original = app.selected;
+        let start = Instant::now();
+        assert!(app.scroll(ScrollDown, start, 0));
+        assert_ne!(app.selected, original);
+        assert!(!app.scroll(ScrollDown, start, 0));
+        assert!(app.scroll(ScrollUp, start, 0));
+        assert_eq!(app.selected, original);
+        assert!(app.scroll(ScrollDown, start, 0));
+        assert!(!app.scroll(
+            ScrollDown,
+            start + VERTICAL_SCROLL_INTERVAL - Duration::from_nanos(1),
+            0
+        ));
+        assert!(app.scroll(ScrollDown, start + VERTICAL_SCROLL_INTERVAL, 0));
+    }
+
+    #[test]
+    fn horizontal_bursts_stay_throttled_across_view_changes_in_every_motion_mode() {
+        for (no_motion, paused) in [(false, false), (true, false), (false, true)] {
+            let mut app = demo();
+            app.no_motion = no_motion;
+            app.paused = paused;
+            let start = Instant::now();
+            for milliseconds in 0..250 {
+                assert_eq!(
+                    app.scroll(ScrollRight, start + Duration::from_millis(milliseconds), 0),
+                    milliseconds == 0
+                );
+                assert_eq!(app.view, View::ProcessMap);
+            }
+            assert!(app.scroll(ScrollRight, start + HORIZONTAL_SCROLL_INTERVAL, 0));
+            assert_eq!(app.view, View::History);
+            assert!(app.scroll(ScrollLeft, start + HORIZONTAL_SCROLL_INTERVAL, 0));
+            assert_eq!(app.view, View::ProcessMap);
+            assert!(!app.scroll(ScrollLeft, start + HORIZONTAL_SCROLL_INTERVAL, 0));
+        }
+    }
+
+    #[test]
+    fn axes_are_independent_and_new_vertical_targets_respond_immediately() {
+        let mut app = demo();
+        let now = Instant::now();
+        assert!(app.scroll(ScrollDown, now, 100));
+        assert!(app.scroll(ScrollRight, now, 100));
+        assert!(!app.scroll(ScrollRight, now, 100));
+        // Switching screens, opening the inspector, changing focus, and opening
+        // help must not inherit the previous list's vertical cooldown.
+        assert!(app.scroll(ScrollDown, now, 100));
+        assert!(!app.scroll(ScrollDown, now, 100));
+        app.navigation_key(KeyCode::Char('i'));
+        assert!(app.scroll(ScrollDown, now, 100));
+        assert!(!app.scroll(ScrollDown, now, 100));
+        app.navigation_key(KeyCode::Tab);
+        assert!(app.scroll(ScrollDown, now, 100));
+        app.navigation_key(KeyCode::Char('g'));
+        assert!(app.scroll(ScrollDown, now, 100));
+        assert!(!app.scroll(ScrollDown, now, 100));
+        app.help = true;
+        assert!(app.scroll(ScrollDown, now, 100));
+        assert_eq!(app.help_scroll, 1);
+        assert!(!app.scroll(ScrollRight, now, 100));
+        app.help = false;
+        assert!(app.scroll(ScrollDown, now, 100));
+    }
+
+    #[test]
+    fn session_lists_take_the_same_single_step_as_keyboard_navigation() {
+        for view in [View::Overview, View::ProcessMap, View::History] {
+            let mut app = demo();
+            app.set_view(view);
+            let mut expected = demo();
+            expected.set_view(view);
+            expected.move_cursor(1);
+            let now = Instant::now();
+            assert!(app.scroll(ScrollDown, now, 0));
+            assert_eq!(app.selected, expected.selected);
+            for _ in 0..100 {
+                assert!(!app.scroll(ScrollDown, now, 0));
+            }
+            assert_eq!(app.selected, expected.selected);
+        }
+    }
+
+    #[test]
+    fn inspector_and_heatmap_take_one_process_step_per_accepted_tick() {
+        for heatmap in [false, true] {
+            let mut app = demo();
+            app.navigation_key(KeyCode::Enter);
+            if heatmap {
+                app.navigation_key(KeyCode::Char('g'));
+                let first = app.heatmap_processes()[0].key;
+                app.click(ui::HitTarget::Process(first));
+            }
+            let mut expected = demo();
+            expected.navigation_key(KeyCode::Enter);
+            if heatmap {
+                expected.navigation_key(KeyCode::Char('g'));
+                let first = expected.heatmap_processes()[0].key;
+                expected.click(ui::HitTarget::Process(first));
+            }
+            let family = app.selected;
+            let process = app.explorer.selected();
+            expected.move_cursor(1);
+            let now = Instant::now();
+            assert!(app.scroll(ScrollDown, now, 0));
+            for _ in 0..100 {
+                assert!(!app.scroll(ScrollDown, now, 0));
+            }
+            assert_eq!(app.selected, family);
+            assert_ne!(app.explorer.selected(), process);
+            assert_eq!(app.explorer.selected(), expected.explorer.selected());
+            app.select(1); // A different family's process list is a fresh target.
+            assert!(app.scroll(ScrollDown, now, 0));
+        }
+    }
+
+    #[test]
+    fn changes_list_is_throttled_and_help_stays_clamped() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        for _ in 0..30 {
+            app.update(sampler.sample(false));
+        }
+        app.open_changes();
+        let expected = app.changes.events().iter().rev().nth(1).unwrap().sequence;
+        let now = Instant::now();
+        assert!(app.scroll(ScrollDown, now, 0));
+        assert_eq!(app.change_selected, Some(expected));
+        assert!(!app.scroll(ScrollDown, now, 0));
+        assert_eq!(app.change_selected, Some(expected));
+        app.help = true;
+        app.help_scroll = usize::MAX;
+        assert!(app.scroll(ScrollDown, now, 5));
+        assert_eq!(app.help_scroll, 5);
+        assert!(app.scroll(ScrollUp, now, 5));
+        assert_eq!(app.help_scroll, 4);
+        app.help_scroll = 0;
+        assert!(app.scroll(ScrollUp, now + VERTICAL_SCROLL_INTERVAL, 5));
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn editors_and_tour_do_not_scroll_or_consume_the_first_tick() {
+        for mode in 0..4 {
+            let mut app = demo();
+            match mode {
+                0 => app.editing_search = true,
+                1 => app.editing_rename = app.selected,
+                2 => app.editing_recording = true,
+                _ => app.tour = true,
+            }
+            let original = app.selected;
+            let now = Instant::now();
+            for direction in [ScrollUp, ScrollDown, ScrollLeft, ScrollRight] {
+                assert!(!app.scroll(direction, now, 100));
+            }
+            assert_eq!(app.selected, original);
+            assert_eq!(app.view, View::Overview);
+            app.editing_search = false;
+            app.editing_rename = None;
+            app.editing_recording = false;
+            app.tour = false;
+            assert!(app.scroll(ScrollDown, now, 0));
+            assert!(app.scroll(ScrollRight, now, 0));
+        }
+    }
+
+    #[test]
+    fn wheel_throttles_never_limit_keyboard_or_click_navigation() {
+        let mut app = demo();
+        let now = Instant::now();
+        assert!(app.scroll(ScrollDown, now, 0));
+        assert!(app.scroll(ScrollRight, now, 0));
+        for view in [
+            View::History,
+            View::Changes,
+            View::Overview,
+            View::ProcessMap,
+        ] {
+            assert!(app.navigation_key(KeyCode::Right));
+            assert_eq!(app.view, view);
+        }
+        app.click(ui::HitTarget::View(View::Overview));
+        for key in app
+            .sessions()
+            .iter()
+            .map(|session| session.key)
+            .collect::<Vec<_>>()
+        {
+            app.click(ui::HitTarget::Session(key));
+            assert_eq!(app.selected, Some(key));
+            app.move_cursor(1);
+            assert_ne!(app.selected, Some(key));
+        }
+        assert!(!app.scroll(MouseEventKind::Down(MouseButton::Left), now, 0));
+        assert!(!app.scroll(MouseEventKind::Moved, now, 0));
     }
 }
