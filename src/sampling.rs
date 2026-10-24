@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind};
 
+use crate::attachment::{PidAttachment, RootObservation};
 use crate::model::{
     HistoryStore, ProcessKey, ProcessSnapshot, Snapshot, SystemSnapshot, group_processes,
     sanitize_name,
@@ -41,6 +42,12 @@ impl CpuDeltas {
     fn retain(&mut self, alive: &HashSet<ProcessKey>) {
         self.previous.retain(|key, _| alive.contains(key));
     }
+}
+
+/// Monotonic clocks can exclude suspend. Clock disagreement is a gap, never
+/// proof that sleep occurred. Pure helper keeps the timing rule testable.
+fn cpu_clock_gap(monotonic: Duration, wall: Option<Duration>, maximum: Duration) -> bool {
+    monotonic > maximum || wall.is_none_or(|wall| wall.abs_diff(monotonic) > Duration::from_secs(2))
 }
 
 fn basename(value: &str) -> &str {
@@ -140,13 +147,41 @@ fn belongs_to_user(owner: Option<&Uid>, current: Option<&Uid>) -> bool {
     matches!((owner, current), (Some(owner), Some(current)) if owner == current)
 }
 
+fn root_observation(system: &System, current: Option<&Uid>, pid: u32) -> RootObservation {
+    match system
+        .process(Pid::from_u32(pid))
+        .filter(|process| process.exists())
+    {
+        Some(process) if belongs_to_user(process.user_id(), current) => {
+            RootObservation::Present(ProcessKey {
+                pid,
+                started: process.start_time(),
+            })
+        }
+        Some(_) => RootObservation::Unavailable,
+        None => RootObservation::Missing,
+    }
+}
+
+/// Preserve the explicit root even if it has a high PID. A family can still be
+/// incomplete, but this cap cannot be mistaken for root disappearance.
+fn limit_process_ids(pids: &mut Vec<Pid>, requested_pid: Option<u32>) -> bool {
+    pids.sort_unstable_by_key(|pid| (Some(pid.as_u32()) != requested_pid, pid.as_u32()));
+    let truncated = pids.len() > MAX_PROCESSES;
+    pids.truncate(MAX_PROCESSES);
+    truncated
+}
+
 pub struct LiveSampler {
     system: System,
     current_user: Option<Uid>,
     started: Instant,
     last_system_cpu: Option<Instant>,
+    last_observation: Option<(Instant, SystemTime)>,
+    max_cpu_gap: Duration,
     cpu: CpuDeltas,
     history: HistoryStore,
+    attachment: Option<PidAttachment>,
 }
 
 impl Default for LiveSampler {
@@ -172,9 +207,33 @@ impl LiveSampler {
             current_user,
             started: Instant::now(),
             last_system_cpu: None,
+            last_observation: None,
+            max_cpu_gap: Duration::from_secs(3),
             cpu: CpuDeltas::default(),
             history: HistoryStore::default(),
+            attachment: None,
         }
+    }
+
+    /// Observe one existing current-user PID and its currently visible descendants.
+    /// The first sample locks PID + start time. Loss of the root ends attachment;
+    /// it never launches a process, sends a signal, or follows a reused PID.
+    pub fn with_pid(pid: u32) -> Self {
+        Self {
+            attachment: Some(PidAttachment::new(pid)),
+            ..Self::new()
+        }
+    }
+
+    /// A resumed/scope-changed observation primes CPU counters again. Unknown is
+    /// not zero, and the unknown sample is retained in history as a visible gap.
+    pub fn reset_cpu_baseline(&mut self) {
+        self.cpu = CpuDeltas::default();
+        self.last_system_cpu = None;
+    }
+
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.max_cpu_gap = interval.saturating_mul(3).max(Duration::from_secs(3));
     }
 
     pub fn sample(&mut self, all_processes: bool) -> Snapshot {
@@ -196,6 +255,13 @@ impl LiveSampler {
                 .and_then(|p| p.user_id())
                 .cloned();
         }
+        if let Some(attachment) = self.attachment.as_mut() {
+            attachment.observe(root_observation(
+                &self.system,
+                self.current_user.as_ref(),
+                attachment.requested_pid(),
+            ));
+        }
         let inaccessible_count = self
             .system
             .processes()
@@ -209,17 +275,40 @@ impl LiveSampler {
             .filter(|(_, p)| belongs_to_user(p.user_id(), self.current_user.as_ref()))
             .map(|(&pid, _)| pid)
             .collect();
-        pids.sort_unstable_by_key(|pid| pid.as_u32());
-        let truncated = pids.len() > MAX_PROCESSES;
-        pids.truncate(MAX_PROCESSES);
+        let requested_pid = self.attachment.as_ref().map(PidAttachment::requested_pid);
+        let truncated = limit_process_ids(&mut pids, requested_pid);
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&pids),
             true,
             ProcessRefreshKind::nothing()
                 .without_tasks()
+                .with_user(UpdateKind::Always)
                 .with_cpu()
                 .with_memory(),
         );
+        // Revalidate after the resource refresh as the OS table can race. The
+        // root was observed and prioritized before the cap, never inferred from
+        // a possibly incomplete family vector.
+        if let Some(attachment) = self.attachment.as_mut() {
+            attachment.observe(root_observation(
+                &self.system,
+                self.current_user.as_ref(),
+                attachment.requested_pid(),
+            ));
+        }
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        if let Some((last, last_wall)) = self.last_observation {
+            let monotonic_delta = now.duration_since(last);
+            if cpu_clock_gap(
+                monotonic_delta,
+                wall.duration_since(last_wall).ok(),
+                self.max_cpu_gap,
+            ) {
+                self.reset_cpu_baseline();
+            }
+        }
+        self.last_observation = Some((now, wall));
         let at = self.started.elapsed();
 
         let runtime_pids: Vec<Pid> = pids
@@ -282,7 +371,10 @@ impl LiveSampler {
             swap_used: self.system.used_swap(),
             ..SystemSnapshot::default()
         };
-        let mut sessions = group_processes(processes, all_processes);
+        let mut sessions = match self.attachment.as_ref() {
+            Some(attachment) => attachment.group(processes),
+            None => group_processes(processes, all_processes),
+        };
         self.history.record(&mut sessions, &mut system);
         Snapshot {
             timestamp: SystemTime::now()
@@ -294,9 +386,10 @@ impl LiveSampler {
             system,
             process_count,
             inaccessible_count,
-            all_processes,
+            all_processes: all_processes && self.attachment.is_none(),
             demo: false,
             truncated,
+            attachment: self.attachment.as_ref().and_then(PidAttachment::snapshot),
         }
     }
 
@@ -397,6 +490,22 @@ impl DemoSampler {
                 });
             }
         }
+        // Simulated build activity makes the changes view explorable without
+        // observing or launching real work. The child identity changes each cycle.
+        let phase = frame % 60;
+        if (12..40).contains(&phase) {
+            processes.push(ProcessSnapshot {
+                key: ProcessKey {
+                    pid: 4290,
+                    started: 1_780_000_012 + (frame / 60) * 60,
+                },
+                ppid: Some(4200),
+                name: "vite".into(),
+                cpu_percent: Some(38.0),
+                rss_bytes: (if phase < 20 { 192 } else { 320 }) * 1024 * 1024,
+                agent: None,
+            });
+        }
         let process_count = processes.len();
         let mut sessions = group_processes(processes, all_processes);
         let total = 16 * 1024_u64.pow(3);
@@ -421,6 +530,7 @@ impl DemoSampler {
             all_processes,
             demo: true,
             truncated: false,
+            attachment: None,
         }
     }
 }
@@ -514,6 +624,37 @@ mod tests {
     }
 
     #[test]
+    fn process_cap_prioritizes_explicit_root_without_changing_default_order() {
+        let root = MAX_PROCESSES as u32 + 100;
+        let all: Vec<_> = (1..=root).rev().map(Pid::from_u32).collect();
+        let mut default = all.clone();
+        assert!(limit_process_ids(&mut default, None));
+        assert_eq!(default.len(), MAX_PROCESSES);
+        assert_eq!(default.first().unwrap().as_u32(), 1);
+        assert!(!default.contains(&Pid::from_u32(root)));
+        let mut attached = all;
+        assert!(limit_process_ids(&mut attached, Some(root)));
+        assert_eq!(attached.len(), MAX_PROCESSES);
+        assert_eq!(attached.first().unwrap().as_u32(), root);
+        assert_eq!(attached.iter().collect::<HashSet<_>>().len(), MAX_PROCESSES);
+        assert!(!limit_process_ids(&mut Vec::new(), Some(root)));
+    }
+
+    #[test]
+    fn root_observation_does_not_disclose_unknown_owner_identity() {
+        let sampler = LiveSampler::new();
+        let pid = std::process::id();
+        assert!(matches!(
+            root_observation(&sampler.system, None, pid),
+            RootObservation::Unavailable
+        ));
+        assert!(matches!(
+            root_observation(&System::new(), sampler.current_user.as_ref(), pid),
+            RootObservation::Missing
+        ));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn denied_and_different_owners_are_excluded() {
         let user: Uid = "1000".parse().unwrap();
@@ -572,5 +713,99 @@ mod tests {
         assert!(sampler.system.processes().values().all(|p| {
             p.cmd().is_empty() && p.environ().is_empty() && p.cwd().is_none() && p.exe().is_none()
         }));
+    }
+
+    #[test]
+    fn live_attachment_locks_current_owned_process_and_ignores_all_flag() {
+        use crate::model::AttachmentStatus;
+
+        let pid = std::process::id();
+        let mut sampler = LiveSampler::with_pid(pid);
+        let snapshot = sampler.sample(true);
+        let attachment = snapshot.attachment.unwrap();
+        assert_eq!(attachment.requested_pid, pid);
+        assert_eq!(attachment.status, AttachmentStatus::Attached);
+        assert!(!snapshot.all_processes);
+        assert!(!snapshot.demo);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].key.pid, pid);
+        assert_eq!(Some(snapshot.sessions[0].key), attachment.root);
+        assert_eq!(snapshot.sessions[0].processes[0].key.pid, pid);
+        assert!(
+            snapshot.sessions[0]
+                .processes
+                .iter()
+                .all(|p| p.cpu_percent.is_none())
+        );
+        let next = sampler.sample(false);
+        assert_eq!(next.attachment, snapshot.attachment);
+        assert_eq!(next.sessions[0].history.len(), 2);
+        assert!(sampler.system.processes().values().all(|p| {
+            p.cmd().is_empty() && p.environ().is_empty() && p.cwd().is_none() && p.exe().is_none()
+        }));
+    }
+}
+
+#[cfg(test)]
+mod recording_gap_tests {
+    use super::*;
+
+    #[test]
+    fn pause_reset_primes_unknown_cpu_and_history() {
+        let mut sampler = LiveSampler::new();
+        sampler.set_interval(Duration::from_secs(30));
+        assert_eq!(sampler.max_cpu_gap, Duration::from_secs(90));
+        let key = ProcessKey {
+            pid: 7,
+            started: 10,
+        };
+        sampler.cpu.sample(key, Duration::ZERO, 1000);
+        sampler.last_system_cpu = Some(Instant::now());
+        sampler.reset_cpu_baseline();
+        assert!(sampler.last_system_cpu.is_none());
+        assert_eq!(
+            sampler.cpu.sample(key, Duration::from_secs(60), 90000),
+            None
+        );
+        assert_eq!(
+            sampler.cpu.sample(key, Duration::from_secs(61), 91000),
+            Some(100.0)
+        );
+        sampler.reset_cpu_baseline();
+        let snapshot = sampler.sample(true);
+        assert!(snapshot.system.cpu_percent.is_none());
+        assert_eq!(snapshot.system.cpu_history.last(), Some(&None));
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|s| s.cpu_percent().is_none() && s.cpu_history.last() == Some(&None))
+        );
+    }
+
+    #[test]
+    fn delays_and_clock_discontinuities_reprime_without_inventing_sleep() {
+        let max = Duration::from_secs(3);
+        assert!(!cpu_clock_gap(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            max
+        ));
+        assert!(cpu_clock_gap(
+            Duration::from_secs(4),
+            Some(Duration::from_secs(4)),
+            max
+        ));
+        assert!(cpu_clock_gap(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(300)),
+            max
+        ));
+        assert!(cpu_clock_gap(Duration::from_secs(1), None, max));
+        assert!(!cpu_clock_gap(
+            Duration::from_secs(30),
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(90)
+        ));
     }
 }
