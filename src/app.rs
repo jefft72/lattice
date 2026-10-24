@@ -1,0 +1,711 @@
+use crate::{
+    explorer::Explorer,
+    insights::{Insights, rss_delta},
+    model::{ProcessKey, SessionSnapshot, Snapshot},
+    sampling::{DemoSampler, LiveSampler},
+    ui,
+};
+use crossterm::{
+    cursor::Show,
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, enable_raw_mode},
+};
+use ratatui::layout::Rect;
+use std::{
+    collections::HashSet,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sort {
+    Memory,
+    Cpu,
+    Growth,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Focus {
+    Sessions,
+    Processes,
+}
+
+pub struct App {
+    pub snapshot: Snapshot,
+    pub selected: Option<ProcessKey>,
+    pub sort: Sort,
+    pub focused: bool,
+    pub focus: Focus,
+    pub explorer: Explorer,
+    pub insights: Insights,
+    pub pins: HashSet<ProcessKey>,
+    pub query: String,
+    pub editing_search: bool,
+    search_original: String,
+    pub paused: bool,
+    pub help: bool,
+    pub hitboxes: Vec<(Rect, ui::HitTarget)>,
+    pub last_sample: Instant,
+    pub interval: Duration,
+    pub sampler_failed: bool,
+    pub resuming: bool,
+}
+
+impl App {
+    pub fn new(snapshot: Snapshot) -> Self {
+        let mut insights = Insights::default();
+        insights.update(&snapshot);
+        let mut app = Self {
+            snapshot,
+            selected: None,
+            sort: Sort::Memory,
+            focused: false,
+            focus: Focus::Sessions,
+            explorer: Explorer::default(),
+            insights,
+            pins: HashSet::new(),
+            query: String::new(),
+            editing_search: false,
+            search_original: String::new(),
+            paused: false,
+            help: false,
+            hitboxes: Vec::new(),
+            last_sample: Instant::now(),
+            interval: Duration::from_secs(1),
+            sampler_failed: false,
+            resuming: false,
+        };
+        app.reconcile_selection();
+        app
+    }
+    pub fn sessions(&self) -> Vec<&SessionSnapshot> {
+        let query = self.query.to_ascii_lowercase();
+        let mut sessions: Vec<_> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|s| {
+                query.is_empty()
+                    || s.label.to_ascii_lowercase().contains(&query)
+                    || s.key.pid.to_string().contains(&query)
+                    || s.processes.iter().any(|p| {
+                        p.name.to_ascii_lowercase().contains(&query)
+                            || p.pid().to_string().contains(&query)
+                    })
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            let pinned = self.pins.contains(&b.key).cmp(&self.pins.contains(&a.key));
+            let order = match self.sort {
+                Sort::Memory => b.rss_bytes().cmp(&a.rss_bytes()),
+                Sort::Cpu => b
+                    .cpu_percent()
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.cpu_percent().unwrap_or(0.0)),
+                Sort::Growth => self.growth_delta(b).cmp(&self.growth_delta(a)),
+            };
+            pinned.then(order).then_with(|| a.key.pid.cmp(&b.key.pid))
+        });
+        sessions
+    }
+    pub fn growth_delta(&self, session: &SessionSnapshot) -> i64 {
+        self.insights
+            .growth(session.key)
+            .filter(|g| g.sample_count >= 2)
+            .map(|g| g.delta_bytes)
+            .or_else(|| rss_delta(&session.history))
+            .unwrap_or(0)
+    }
+    pub fn stale(&self) -> bool {
+        self.sampler_failed
+            || self.resuming
+            || (!self.paused
+                && self.last_sample.elapsed()
+                    > self.interval.saturating_mul(3).max(Duration::from_secs(3)))
+    }
+    pub fn selected_session(&self) -> Option<&SessionSnapshot> {
+        self.snapshot
+            .sessions
+            .iter()
+            .find(|s| Some(s.key) == self.selected)
+    }
+    fn reconcile_selection(&mut self) {
+        let sessions = self.sessions();
+        if !sessions.iter().any(|s| Some(s.key) == self.selected) {
+            self.selected = sessions.first().map(|s| s.key);
+        }
+        self.reconcile_explorer();
+    }
+    fn reconcile_explorer(&mut self) {
+        if let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|s| Some(s.key) == self.selected)
+        {
+            self.explorer.reconcile(session);
+        }
+    }
+    pub fn update(&mut self, snapshot: Snapshot) {
+        if self.snapshot.all_processes != snapshot.all_processes {
+            self.insights.mark_gap();
+        }
+        self.insights.update(&snapshot);
+        self.snapshot = snapshot;
+        self.last_sample = Instant::now();
+        self.resuming = false;
+        self.pins
+            .retain(|key| self.snapshot.sessions.iter().any(|s| s.key == *key));
+        self.reconcile_selection();
+    }
+    pub fn select(&mut self, direction: i32) {
+        let sessions = self.sessions();
+        if sessions.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let old = sessions
+            .iter()
+            .position(|s| Some(s.key) == self.selected)
+            .unwrap_or(0);
+        let index = (old as i32 + direction).rem_euclid(sessions.len() as i32) as usize;
+        self.selected = Some(sessions[index].key);
+        self.reconcile_explorer();
+    }
+    pub fn move_cursor(&mut self, direction: i32) {
+        if self.focused && self.focus == Focus::Processes {
+            if let Some(session) = self
+                .snapshot
+                .sessions
+                .iter()
+                .find(|s| Some(s.key) == self.selected)
+            {
+                self.explorer.move_selection(session, direction);
+            }
+        } else {
+            self.select(direction);
+        }
+    }
+    pub fn tree_action(&mut self, key: KeyCode) {
+        if let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|s| Some(s.key) == self.selected)
+        {
+            match key {
+                KeyCode::Left | KeyCode::Char('h') => self.explorer.collapse_selected(session),
+                KeyCode::Right | KeyCode::Char('l') => self.explorer.expand_selected(session),
+                KeyCode::Enter => self.explorer.toggle_selected(session),
+                KeyCode::Char('E') => self.explorer.expand_all(session),
+                KeyCode::Char('C') => self.explorer.collapse_all(session),
+                _ => {}
+            }
+        }
+    }
+    pub fn start_search(&mut self) {
+        self.search_original = self.query.clone();
+        self.editing_search = true;
+        self.focus = Focus::Sessions;
+    }
+    pub fn search_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.query = self.search_original.clone();
+                self.editing_search = false;
+            }
+            KeyCode::Enter => self.editing_search = false,
+            KeyCode::Backspace => {
+                self.query.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() && self.query.chars().count() < 64 => {
+                self.query.push(c)
+            }
+            _ => {}
+        }
+        self.reconcile_selection();
+    }
+    pub fn toggle_pin(&mut self) {
+        if let Some(key) = self.selected
+            && !self.pins.remove(&key)
+        {
+            self.pins.insert(key);
+        }
+    }
+    pub fn click(&mut self, target: ui::HitTarget) {
+        match target {
+            ui::HitTarget::Session(key) => {
+                self.selected = Some(key);
+                self.focus = Focus::Sessions;
+                self.reconcile_explorer();
+            }
+            ui::HitTarget::Process(key) => {
+                if let Some(session) = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|s| Some(s.key) == self.selected)
+                {
+                    self.explorer.select_key(session, key);
+                    self.focus = Focus::Processes;
+                }
+            }
+        }
+    }
+}
+
+struct TerminalGuard {
+    signals: Vec<signal_hook::SigId>,
+    active: bool,
+}
+impl TerminalGuard {
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        // Try both even if writing an escape sequence fails: raw mode must be undone.
+        let mouse = execute!(io::stdout(), DisableMouseCapture, Show);
+        let terminal = ratatui::try_restore();
+        mouse.and(terminal)?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn suspend(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
+        self.restore()?;
+        // Keep terminal I/O out of signal handlers. This stops every thread without
+        // unregistering SIGTSTP, so later suspend cycles still take this cleanup path.
+        signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP)?;
+        // Execution continues here after SIGCONT. A termination signal delivered
+        // while stopped takes priority over re-entering the UI.
+        if !stop.load(Ordering::Relaxed) {
+            self.active = true;
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+            terminal.hide_cursor()?;
+            // The shell may have changed the screen and size while we were stopped.
+            // Invalidate the diff buffer so even an unchanged frame is fully redrawn.
+            // Force resize even when dimensions match; unlike clear(), this does
+            // not require a cursor-position query/response from the terminal.
+            terminal.resize(terminal.size()?.into())?;
+        }
+        Ok(())
+    }
+}
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+        for signal in &self.signals {
+            signal_hook::low_level::unregister(*signal);
+        }
+    }
+}
+
+pub fn run(demo: bool, all: bool, interval: Duration) -> io::Result<()> {
+    // A bounded channel decouples potentially slow process reads from input/rendering.
+    let stop = Arc::new(AtomicBool::new(false));
+    let show_all = Arc::new(AtomicBool::new(all));
+    let paused = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::sync_channel(1);
+    let generation = Arc::new(AtomicU64::new(0));
+    let mut guard = TerminalGuard {
+        signals: Vec::new(),
+        active: false,
+    };
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGQUIT,
+    ] {
+        guard
+            .signals
+            .push(signal_hook::flag::register(signal, stop.clone())?);
+    }
+    let worker_stop = stop.clone();
+    let worker_all = show_all.clone();
+    let worker_pause = paused.clone();
+    let worker_generation = generation.clone();
+    let worker = thread::spawn(move || {
+        let mut demo_sampler = demo.then(DemoSampler::new);
+        let mut live_sampler = (!demo).then(LiveSampler::new);
+        while !worker_stop.load(Ordering::Relaxed) {
+            let start = Instant::now();
+            let sample_generation = worker_generation.load(Ordering::Acquire);
+            if !worker_pause.load(Ordering::Relaxed) {
+                let all = worker_all.load(Ordering::Relaxed);
+                let next = match (&mut demo_sampler, &mut live_sampler) {
+                    (Some(s), _) => s.sample(all),
+                    (_, Some(s)) => s.sample(all),
+                    _ => unreachable!(),
+                };
+                if !worker_pause.load(Ordering::Acquire)
+                    && worker_generation.load(Ordering::Acquire) == sample_generation
+                    && tx.try_send((sample_generation, next)).is_err()
+                    && worker_stop.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+            }
+            while start.elapsed() < interval && !worker_stop.load(Ordering::Relaxed) {
+                if worker_generation.load(Ordering::Acquire) != sample_generation {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_millis(40).min(interval.saturating_sub(start.elapsed())),
+                );
+            }
+        }
+    });
+    let initial = match wait_initial(&rx, &stop) {
+        Ok(Some(snapshot)) => snapshot,
+        result => {
+            stop.store(true, Ordering::Relaxed);
+            return result.map(|_| ());
+        }
+    };
+    let mut app = App::new(initial);
+    app.interval = interval;
+    let suspend = Arc::new(AtomicBool::new(false));
+    // Before this point SIGTSTP can use its default action: no terminal state has
+    // been changed, including while the first sampler read is still pending.
+    guard.signals.push(signal_hook::flag::register(
+        signal_hook::consts::SIGTSTP,
+        suspend.clone(),
+    )?);
+    guard.active = true;
+    let mut terminal = ratatui::try_init()?;
+    execute!(io::stdout(), EnableMouseCapture)?;
+    let outcome = (|| -> io::Result<()> {
+        let mut dirty = true;
+        let mut last_draw = Instant::now();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if suspend.swap(false, Ordering::Relaxed) {
+                guard.suspend(&mut terminal, &stop)?;
+                dirty = true;
+                continue;
+            }
+            match rx.try_recv() {
+                Ok((epoch, next)) => {
+                    if !app.paused && epoch == generation.load(Ordering::Acquire) {
+                        app.update(next);
+                        dirty = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other("process sampler stopped unexpectedly"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
+                terminal.draw(|frame| {
+                    app.hitboxes = ui::draw(frame, &app);
+                })?;
+                dirty = false;
+                last_draw = Instant::now();
+            }
+            if event::poll(Duration::from_millis(80))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        dirty = true;
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            break;
+                        }
+                        // Raw mode disables the terminal driver's Ctrl-Z signal.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('z')
+                        {
+                            suspend.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        if app.editing_search {
+                            app.search_key(key.code);
+                            continue;
+                        }
+                        if key.code == KeyCode::Char('q') {
+                            break;
+                        }
+                        if app.help {
+                            if matches!(
+                                key.code,
+                                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter
+                            ) {
+                                app.help = false;
+                            }
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
+                            KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
+                            KeyCode::PageDown => app.move_cursor(8),
+                            KeyCode::PageUp => app.move_cursor(-8),
+                            KeyCode::Tab | KeyCode::BackTab => {
+                                if app.focused {
+                                    app.focus = if app.focus == Focus::Sessions {
+                                        Focus::Processes
+                                    } else {
+                                        Focus::Sessions
+                                    };
+                                } else {
+                                    app.select(if key.code == KeyCode::Tab { 1 } else { -1 });
+                                }
+                            }
+                            KeyCode::Enter if app.focused && app.focus == Focus::Processes => {
+                                app.tree_action(key.code)
+                            }
+                            KeyCode::Enter => {
+                                app.focused = true;
+                                app.focus = Focus::Processes;
+                            }
+                            KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Char('h' | 'l' | 'E' | 'C')
+                                if app.focused && app.focus == Focus::Processes =>
+                            {
+                                app.tree_action(key.code)
+                            }
+                            KeyCode::Esc => {
+                                if app.focused {
+                                    app.focused = false;
+                                    app.focus = Focus::Sessions;
+                                } else {
+                                    app.query.clear();
+                                    app.reconcile_selection();
+                                }
+                            }
+                            KeyCode::Char('?') => app.help = true,
+                            KeyCode::Char('/') => app.start_search(),
+                            KeyCode::Char('*') => app.toggle_pin(),
+                            KeyCode::Char('s') => {
+                                app.sort = match app.sort {
+                                    Sort::Memory => Sort::Cpu,
+                                    Sort::Cpu => Sort::Growth,
+                                    Sort::Growth => Sort::Memory,
+                                }
+                            }
+                            KeyCode::Char('a') => {
+                                show_all.fetch_xor(true, Ordering::Relaxed);
+                                generation.fetch_add(1, Ordering::AcqRel);
+                                while rx.try_recv().is_ok() {}
+                                if !app.paused {
+                                    app.resuming = true;
+                                }
+                            }
+                            KeyCode::Char(' ') | KeyCode::Char('p') => {
+                                app.paused = !app.paused;
+                                if !app.paused {
+                                    app.insights.mark_gap();
+                                }
+                                paused.store(app.paused, Ordering::Release);
+                                generation.fetch_add(1, Ordering::AcqRel);
+                                while rx.try_recv().is_ok() {}
+                                app.resuming = !app.paused;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) if !app.help => {
+                            if let Some((_, key)) = app
+                                .hitboxes
+                                .iter()
+                                .find(|(r, _)| r.contains((mouse.column, mouse.row).into()))
+                            {
+                                app.click(*key);
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::ScrollDown if !app.help => {
+                            app.move_cursor(1);
+                            dirty = true;
+                        }
+                        MouseEventKind::ScrollUp if !app.help => {
+                            app.move_cursor(-1);
+                            dirty = true;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    drop(guard);
+    // Detach if a platform read stalls: terminal restoration must not wait on the sampler.
+    if worker.is_finished() {
+        let _ = worker.join();
+    }
+    outcome
+}
+
+// Keep cancellation responsive even if the first platform read stalls.
+fn wait_initial(
+    rx: &mpsc::Receiver<(u64, Snapshot)>,
+    stop: &AtomicBool,
+) -> io::Result<Option<Snapshot>> {
+    let started = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            return Err(io::Error::other(
+                "process sampler did not start within 10 seconds",
+            ));
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((_, snapshot)) => return Ok(Some(snapshot)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("process sampler could not start"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn startup_wait_is_cancellable_without_a_first_sample() {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let stop = AtomicBool::new(true);
+        assert!(wait_initial(&rx, &stop).unwrap().is_none());
+    }
+    #[test]
+    fn stale_age_respects_interval_and_pause() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.last_sample = Instant::now() - Duration::from_secs(5);
+        assert!(app.stale());
+        app.interval = Duration::from_secs(30);
+        assert!(!app.stale());
+        app.interval = Duration::from_secs(1);
+        app.paused = true;
+        assert!(!app.stale());
+        app.sampler_failed = true;
+        assert!(app.stale());
+    }
+    #[test]
+    fn selection_survives_resorting_and_updates() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        app.select(1);
+        let selected = app.selected;
+        app.sort = Sort::Cpu;
+        app.update(sampler.sample(false));
+        assert_eq!(app.selected, selected);
+    }
+    #[test]
+    fn empty_selection_is_safe() {
+        let mut snapshot = DemoSampler::new().sample(false);
+        snapshot.sessions.clear();
+        let mut app = App::new(snapshot);
+        app.select(-1);
+        assert!(app.selected.is_none());
+    }
+    #[test]
+    fn disappearing_selection_recovers() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        let selected = app.selected;
+        let mut next = sampler.sample(false);
+        next.sessions.retain(|s| Some(s.key) != selected);
+        app.update(next);
+        assert_ne!(app.selected, selected);
+        assert!(app.selected_session().is_some());
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    #[test]
+    fn search_preserves_typed_q_and_reconciles_visible_selection() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.start_search();
+        for c in "codex".chars() {
+            app.search_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.sessions().len(), 1);
+        assert_eq!(app.selected_session().unwrap().label, "codex");
+        app.search_key(KeyCode::Char('q'));
+        assert_eq!(app.query, "codexq");
+        assert!(app.selected.is_none());
+        app.search_key(KeyCode::Esc);
+        assert!(app.query.is_empty());
+        assert!(app.selected.is_some());
+        assert!(!app.editing_search);
+    }
+    #[test]
+    fn search_matches_process_names_and_pid_without_arguments() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        app.start_search();
+        for c in "4100".chars() {
+            app.search_key(KeyCode::Char(c));
+        }
+        app.search_key(KeyCode::Enter);
+        assert_eq!(app.sessions().len(), 1);
+        assert_eq!(app.selected.unwrap().pid, 4100);
+        app.query = "pytest".into();
+        assert!(
+            app.sessions()
+                .iter()
+                .all(|s| s.processes.iter().any(|p| p.name.contains("pytest")))
+        );
+    }
+    #[test]
+    fn pins_float_above_sort_but_do_not_resurrect_exited_roots() {
+        let mut sampler = DemoSampler::new();
+        let mut app = App::new(sampler.sample(false));
+        app.select(3);
+        let key = app.selected.unwrap();
+        app.toggle_pin();
+        assert_eq!(app.sessions()[0].key, key);
+        app.sort = Sort::Growth;
+        assert_eq!(app.sessions()[0].key, key);
+        let mut next = sampler.sample(false);
+        next.sessions.retain(|s| s.key != key);
+        app.update(next);
+        assert!(!app.pins.contains(&key));
+    }
+    #[test]
+    fn process_navigation_does_not_switch_the_selected_session() {
+        let mut app = App::new(DemoSampler::new().sample(false));
+        let key = app.selected;
+        app.focused = true;
+        app.focus = Focus::Processes;
+        app.move_cursor(1);
+        assert_eq!(app.selected, key);
+        assert_ne!(app.explorer.selected(), key);
+        app.tree_action(KeyCode::Char('C'));
+        assert_eq!(app.explorer.selected(), key);
+        app.tree_action(KeyCode::Char('E'));
+        assert!(
+            app.explorer
+                .visible_rows(app.selected_session().unwrap())
+                .len()
+                > 1
+        );
+    }
+}
