@@ -190,7 +190,7 @@ fn snapshot_screen_and_graph_selectors_are_explicit_and_validated() {
     let version = binary().arg("--version").output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
-        "lattice 0.3.0"
+        "lattice 0.4.0"
     );
 }
 

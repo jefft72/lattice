@@ -38,5 +38,22 @@ jobs:
         run: python3 tools/practical_smoke.py target/release/lattice
       - name: Navigation interactions
         run: python3 tools/navigation_smoke.py target/release/lattice
+      - name: Local recording workflows
+        run: python3 tools/recording_smoke.py target/release/lattice
+      - name: Recording I/O stalls and backpressure
+        run: python3 tools/recording_io_smoke.py
+      - name: Launcher path parity
+        run: python3 tools/launcher_paths_smoke.py target/release/lattice
       - name: Failure-path cleanup
         run: python3 tools/fault_smoke.py
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Test minimum supported Rust
+        run: cargo +1.95.0 test --locked
