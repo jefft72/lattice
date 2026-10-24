@@ -2,7 +2,7 @@ use crate::{
     changes::Changes,
     explorer::Explorer,
     insights::{Insights, rss_delta},
-    model::{AttachmentStatus, ProcessKey, SessionSnapshot, Snapshot},
+    model::{AttachmentStatus, ProcessKey, ProcessSnapshot, SessionSnapshot, Snapshot},
     sampling::{DemoSampler, LiveSampler},
     ui,
 };
@@ -40,7 +40,89 @@ pub enum Focus {
     Processes,
 }
 
+/// Independent screens share selection, filters, pins and the process explorer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum View {
+    Overview,
+    #[value(name = "map")]
+    ProcessMap,
+    History,
+    Changes,
+}
+
+impl View {
+    pub const ALL: [Self; 4] = [
+        Self::Overview,
+        Self::ProcessMap,
+        Self::History,
+        Self::Changes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::ProcessMap => "Process Map",
+            Self::History => "History",
+            Self::Changes => "Changes",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::ProcessMap => 1,
+            Self::History => 2,
+            Self::Changes => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum GraphMode {
+    Constellation,
+    Heatmap,
+}
+
+impl GraphMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Constellation => "Constellation",
+            Self::Heatmap => "Heat map",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Metric {
+    Rss,
+    Cpu,
+}
+
+impl Metric {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rss => "RAM",
+            Self::Cpu => "CPU",
+        }
+    }
+}
+
+pub const VIEW_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+const TRANSITION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+#[derive(Clone, Copy, Debug)]
+pub struct ViewTransition {
+    pub from: View,
+    pub to: View,
+    pub direction: i32,
+    pub started: Instant,
+}
+
 pub struct App {
+    pub view: View,
+    pub graph_mode: GraphMode,
+    pub metric: Metric,
+    pub transition: Option<ViewTransition>,
     pub snapshot: Snapshot,
     pub selected: Option<ProcessKey>,
     pub sort: Sort,
@@ -82,6 +164,10 @@ impl App {
         let mut changes = Changes::default();
         changes.observe(&snapshot);
         let mut app = Self {
+            view: View::Overview,
+            graph_mode: GraphMode::Constellation,
+            metric: Metric::Rss,
+            transition: None,
             snapshot,
             selected: None,
             sort: Sort::Memory,
@@ -117,6 +203,160 @@ impl App {
         app.reconcile_selection();
         app
     }
+    pub fn set_view(&mut self, view: View) {
+        self.show_changes = view == View::Changes;
+        if self.view == view {
+            if self.no_motion || self.paused || self.stale() {
+                self.transition = None;
+            }
+            return;
+        }
+        let from = self.view;
+        self.view = view;
+        self.transition =
+            (!self.no_motion && !self.paused && !self.stale()).then(|| ViewTransition {
+                from,
+                to: view,
+                direction: if view.index() > from.index() { 1 } else { -1 },
+                started: Instant::now(),
+            });
+        if view == View::Changes
+            && !self
+                .changes
+                .events()
+                .iter()
+                .any(|event| Some(event.sequence) == self.change_selected)
+        {
+            self.change_selected = self.changes.events().back().map(|event| event.sequence);
+        }
+    }
+
+    pub fn navigate_view(&mut self, delta: i32) {
+        let index = (self.view.index() as i64 + i64::from(delta)).rem_euclid(View::ALL.len() as i64)
+            as usize;
+        let previous = self.view;
+        self.set_view(View::ALL[index]);
+        if previous != self.view
+            && let Some(transition) = &mut self.transition
+        {
+            transition.direction = delta.signum();
+        }
+    }
+
+    pub fn navigation_blocked(&self) -> bool {
+        self.editing_search || self.editing_rename.is_some() || self.help || self.tour
+    }
+
+    /// Return true only when a navigation/inspector key was handled. Editors and
+    /// guides own their keys; process arrows remain tree controls in the inspector.
+    pub fn navigation_key(&mut self, key: KeyCode) -> bool {
+        if self.navigation_blocked() {
+            return false;
+        }
+        match key {
+            KeyCode::Char('1'..='4') => {
+                let KeyCode::Char(digit) = key else {
+                    unreachable!()
+                };
+                self.set_view(View::ALL[(digit as u8 - b'1') as usize]);
+            }
+            KeyCode::Char('[') => self.navigate_view(-1),
+            KeyCode::Char(']') => self.navigate_view(1),
+            KeyCode::Left | KeyCode::Right
+                if self.view == View::ProcessMap
+                    && self.focused
+                    && self.focus == Focus::Processes =>
+            {
+                self.tree_action(key);
+            }
+            KeyCode::Left => self.navigate_view(-1),
+            KeyCode::Right => self.navigate_view(1),
+            KeyCode::Char('g') if self.view == View::ProcessMap => {
+                self.graph_mode = match self.graph_mode {
+                    GraphMode::Constellation => GraphMode::Heatmap,
+                    GraphMode::Heatmap => GraphMode::Constellation,
+                };
+                self.focused = false;
+                self.focus = if self.graph_mode == GraphMode::Heatmap {
+                    Focus::Processes
+                } else {
+                    Focus::Sessions
+                };
+            }
+            KeyCode::Char('m')
+                if self.view == View::History
+                    || (self.view == View::ProcessMap && self.graph_mode == GraphMode::Heatmap) =>
+            {
+                self.metric = match self.metric {
+                    Metric::Rss => Metric::Cpu,
+                    Metric::Cpu => Metric::Rss,
+                };
+            }
+            KeyCode::Char('i') => {
+                if self.view != View::ProcessMap {
+                    self.set_view(View::ProcessMap);
+                    self.focused = true;
+                } else {
+                    self.focused = !self.focused;
+                }
+                self.focus = if self.focused || self.graph_mode == GraphMode::Heatmap {
+                    Focus::Processes
+                } else {
+                    Focus::Sessions
+                };
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.view == View::ProcessMap
+                    && (self.focused || self.graph_mode == GraphMode::Heatmap)
+                {
+                    self.focus = if self.focus == Focus::Sessions {
+                        Focus::Processes
+                    } else {
+                        Focus::Sessions
+                    };
+                } else {
+                    self.select(if key == KeyCode::Tab { 1 } else { -1 });
+                }
+            }
+            KeyCode::Enter if self.view != View::Changes => {
+                if self.view == View::ProcessMap && self.focused && self.focus == Focus::Processes {
+                    self.tree_action(key);
+                } else {
+                    self.set_view(View::ProcessMap);
+                    self.focused = true;
+                    self.focus = Focus::Processes;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Completed/disabled transitions never request further animation frames.
+    pub fn transition_progress(&self) -> Option<f32> {
+        let transition = self.transition.as_ref()?;
+        if self.no_motion
+            || self.paused
+            || self.stale()
+            || transition.to != self.view
+            || transition.from == transition.to
+        {
+            return None;
+        }
+        let elapsed = transition.started.elapsed();
+        (elapsed < VIEW_TRANSITION_DURATION)
+            .then(|| elapsed.as_secs_f32() / VIEW_TRANSITION_DURATION.as_secs_f32())
+    }
+
+    fn finish_transition(&mut self) -> bool {
+        if self.transition.is_some() && self.transition_progress().is_none() {
+            self.transition = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn sessions(&self) -> Vec<&SessionSnapshot> {
         let query = self.query.to_ascii_lowercase();
         let mut sessions: Vec<_> = self
@@ -148,6 +388,30 @@ impl App {
         });
         sessions
     }
+    /// The renderer and keyboard use exactly the same all-process heatmap order.
+    pub fn heatmap_processes(&self) -> Vec<&ProcessSnapshot> {
+        let Some(session) = self.selected_session() else {
+            return Vec::new();
+        };
+        let mut processes: Vec<_> = session.processes.iter().collect();
+        processes.sort_by(|a, b| {
+            let metric_order = match self.metric {
+                Metric::Rss => b.rss_bytes.cmp(&a.rss_bytes),
+                Metric::Cpu => {
+                    let known = |process: &ProcessSnapshot| {
+                        process
+                            .cpu_percent
+                            .filter(|cpu| cpu.is_finite() && *cpu >= 0.0)
+                            .unwrap_or(-1.0)
+                    };
+                    known(b).total_cmp(&known(a))
+                }
+            };
+            metric_order.then_with(|| a.key.cmp(&b.key))
+        });
+        processes
+    }
+
     pub fn display_label<'a>(&'a self, session: &'a SessionSnapshot) -> &'a str {
         self.nicknames
             .get(&session.key)
@@ -201,7 +465,7 @@ impl App {
         }
     }
     pub fn open_changes(&mut self) {
-        self.show_changes = true;
+        self.set_view(View::Changes);
         self.change_selected = self.changes.events().back().map(|event| event.sequence);
     }
     pub fn changes_key(&mut self, key: KeyCode) {
@@ -214,7 +478,7 @@ impl App {
             .unwrap_or(0);
         let new_index = match key {
             KeyCode::Esc | KeyCode::Char('e') => {
-                self.show_changes = false;
+                self.set_view(View::Overview);
                 return;
             }
             KeyCode::Down | KeyCode::Char('j') => index.saturating_add(1),
@@ -233,9 +497,9 @@ impl App {
                 {
                     self.selected = Some(event.session_key);
                     self.query.clear();
+                    self.set_view(View::ProcessMap);
                     self.focused = true;
                     self.focus = Focus::Processes;
-                    self.show_changes = false;
                     self.reconcile_explorer();
                 }
                 return;
@@ -290,11 +554,7 @@ impl App {
         }
     }
     pub fn sample_marker(&self) -> &'static str {
-        if self.no_motion || self.paused || self.stale() || self.sample_tick.is_multiple_of(2) {
-            "●"
-        } else {
-            "·"
-        }
+        "●"
     }
     pub fn guide_key(&mut self, key: KeyCode, page_rows: usize) {
         if self.tour {
@@ -360,7 +620,7 @@ impl App {
             self.changes.mark_gap();
         }
         self.changes.observe(&snapshot);
-        if self.show_changes
+        if self.view == View::Changes
             && !self
                 .changes
                 .events()
@@ -393,7 +653,39 @@ impl App {
         self.reconcile_explorer();
     }
     pub fn move_cursor(&mut self, direction: i32) {
-        if self.focused && self.focus == Focus::Processes {
+        if self.view == View::ProcessMap
+            && self.graph_mode == GraphMode::Heatmap
+            && !self.focused
+            && self.focus == Focus::Processes
+        {
+            let target = {
+                let processes = self.heatmap_processes();
+                let index = processes
+                    .iter()
+                    .position(|process| Some(process.key) == self.explorer.selected())
+                    .unwrap_or(0);
+                let next = if direction < 0 {
+                    index.saturating_sub(direction.unsigned_abs() as usize)
+                } else {
+                    index
+                        .saturating_add(direction as usize)
+                        .min(processes.len().saturating_sub(1))
+                };
+                processes.get(next).map(|process| process.key)
+            };
+            if let Some(key) = target
+                && let Some(session) = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| Some(session.key) == self.selected)
+            {
+                self.explorer.reveal_key(session, key);
+            }
+        } else if self.view == View::ProcessMap
+            && self.focus == Focus::Processes
+            && (self.focused || self.graph_mode == GraphMode::Heatmap)
+        {
             if let Some(session) = self
                 .snapshot
                 .sessions
@@ -453,7 +745,11 @@ impl App {
         }
     }
     pub fn click(&mut self, target: ui::HitTarget) {
+        if self.navigation_blocked() {
+            return;
+        }
         match target {
+            ui::HitTarget::View(view) => self.set_view(view),
             ui::HitTarget::Session(key) => {
                 self.selected = Some(key);
                 self.focus = Focus::Sessions;
@@ -466,7 +762,11 @@ impl App {
                     .iter()
                     .find(|s| Some(s.key) == self.selected)
                 {
-                    self.explorer.select_key(session, key);
+                    if self.view == View::ProcessMap && self.graph_mode == GraphMode::Heatmap {
+                        self.explorer.reveal_key(session, key);
+                    } else {
+                        self.explorer.select_key(session, key);
+                    }
                     self.focus = Focus::Processes;
                 }
             }
@@ -644,14 +944,24 @@ pub fn run(
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
-            if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
+            dirty |= app.finish_transition();
+            let transitioning = app.transition_progress().is_some();
+            if dirty
+                || last_draw.elapsed() >= Duration::from_secs(1)
+                || (transitioning && last_draw.elapsed() >= TRANSITION_FRAME_INTERVAL)
+            {
                 terminal.draw(|frame| {
                     app.hitboxes = ui::draw(frame, &app);
                 })?;
                 dirty = false;
                 last_draw = Instant::now();
             }
-            if event::poll(Duration::from_millis(80))? {
+            let poll_interval = if transitioning {
+                TRANSITION_FRAME_INTERVAL.saturating_sub(last_draw.elapsed())
+            } else {
+                Duration::from_millis(80)
+            };
+            if event::poll(poll_interval)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         dirty = true;
@@ -678,10 +988,6 @@ pub fn run(
                         if key.code == KeyCode::Char('q') {
                             break;
                         }
-                        if app.show_changes {
-                            app.changes_key(key.code);
-                            continue;
-                        }
                         if app.help || app.tour {
                             let size = terminal.size()?;
                             let (rows, maximum) = ui::guide_scroll_limits(size.width, size.height);
@@ -690,38 +996,40 @@ pub fn run(
                             app.help_scroll = app.help_scroll.min(maximum);
                             continue;
                         }
+                        if app.navigation_key(key.code) {
+                            continue;
+                        }
+                        if app.view == View::Changes
+                            && matches!(
+                                key.code,
+                                KeyCode::Esc
+                                    | KeyCode::Enter
+                                    | KeyCode::Char('e' | 'j' | 'k')
+                                    | KeyCode::Down
+                                    | KeyCode::Up
+                                    | KeyCode::PageDown
+                                    | KeyCode::PageUp
+                                    | KeyCode::Home
+                                    | KeyCode::End
+                            )
+                        {
+                            app.changes_key(key.code);
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
                             KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
                             KeyCode::PageDown => app.move_cursor(8),
                             KeyCode::PageUp => app.move_cursor(-8),
-                            KeyCode::Tab | KeyCode::BackTab => {
-                                if app.focused {
-                                    app.focus = if app.focus == Focus::Sessions {
-                                        Focus::Processes
-                                    } else {
-                                        Focus::Sessions
-                                    };
-                                } else {
-                                    app.select(if key.code == KeyCode::Tab { 1 } else { -1 });
-                                }
-                            }
-                            KeyCode::Enter if app.focused && app.focus == Focus::Processes => {
-                                app.tree_action(key.code)
-                            }
-                            KeyCode::Enter => {
-                                app.focused = true;
-                                app.focus = Focus::Processes;
-                            }
-                            KeyCode::Left
-                            | KeyCode::Right
-                            | KeyCode::Char('h' | 'l' | 'E' | 'C')
-                                if app.focused && app.focus == Focus::Processes =>
+                            KeyCode::Char('h' | 'l' | 'E' | 'C')
+                                if app.view == View::ProcessMap
+                                    && app.focused
+                                    && app.focus == Focus::Processes =>
                             {
                                 app.tree_action(key.code)
                             }
                             KeyCode::Esc => {
-                                if app.focused {
+                                if app.view == View::ProcessMap && app.focused {
                                     app.focused = false;
                                     app.focus = Focus::Sessions;
                                 } else {
@@ -769,16 +1077,8 @@ pub fn run(
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                            if app.show_changes =>
+                            if app.help && !app.editing_search && app.editing_rename.is_none() =>
                         {
-                            app.changes_key(if mouse.kind == MouseEventKind::ScrollDown {
-                                KeyCode::Down
-                            } else {
-                                KeyCode::Up
-                            });
-                            dirty = true;
-                        }
-                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if app.help => {
                             let size = terminal.size()?;
                             let (_, maximum) = ui::guide_scroll_limits(size.width, size.height);
                             app.help_scroll = app.help_scroll.min(maximum);
@@ -793,37 +1093,35 @@ pub fn run(
                             app.help_scroll = app.help_scroll.min(maximum);
                             dirty = true;
                         }
-                        MouseEventKind::Down(MouseButton::Left)
-                            if !app.help
-                                && !app.tour
-                                && !app.show_changes
-                                && app.editing_rename.is_none() =>
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                            if !app.navigation_blocked() =>
                         {
-                            if let Some((_, key)) = app
+                            app.navigate_view(if mouse.kind == MouseEventKind::ScrollLeft {
+                                -1
+                            } else {
+                                1
+                            });
+                            dirty = true;
+                        }
+                        MouseEventKind::Down(MouseButton::Left) if !app.navigation_blocked() => {
+                            if let Some((_, target)) = app
                                 .hitboxes
                                 .iter()
                                 .find(|(r, _)| r.contains((mouse.column, mouse.row).into()))
                             {
-                                app.click(*key);
+                                app.click(*target);
                                 dirty = true;
                             }
                         }
-                        MouseEventKind::ScrollDown
-                            if !app.help
-                                && !app.tour
-                                && !app.show_changes
-                                && app.editing_rename.is_none() =>
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                            if !app.navigation_blocked() =>
                         {
-                            app.move_cursor(1);
-                            dirty = true;
-                        }
-                        MouseEventKind::ScrollUp
-                            if !app.help
-                                && !app.tour
-                                && !app.show_changes
-                                && app.editing_rename.is_none() =>
-                        {
-                            app.move_cursor(-1);
+                            let down = mouse.kind == MouseEventKind::ScrollDown;
+                            if app.view == View::Changes {
+                                app.changes_key(if down { KeyCode::Down } else { KeyCode::Up });
+                            } else {
+                                app.move_cursor(if down { 1 } else { -1 });
+                            }
                             dirty = true;
                         }
                         _ => {}
@@ -978,6 +1276,7 @@ mod interaction_tests {
     fn process_navigation_does_not_switch_the_selected_session() {
         let mut app = App::new(DemoSampler::new().sample(false));
         let key = app.selected;
+        app.set_view(View::ProcessMap);
         app.focused = true;
         app.focus = Focus::Processes;
         app.move_cursor(1);
@@ -999,14 +1298,14 @@ mod interaction_tests {
 mod onboarding_tests {
     use super::*;
     #[test]
-    fn sample_marker_changes_only_for_received_samples_and_can_be_disabled() {
+    fn sample_marker_stays_static_across_sampling_and_navigation() {
         let mut sampler = DemoSampler::new();
         let mut app = App::new(sampler.sample(false));
         let initial = app.sample_marker();
         app.select(1);
         assert_eq!(app.sample_marker(), initial);
         app.update(sampler.sample(false));
-        assert_ne!(app.sample_marker(), initial);
+        assert_eq!(app.sample_marker(), initial);
         app.paused = true;
         assert_eq!(app.sample_marker(), "●");
         app.paused = false;
@@ -1220,5 +1519,434 @@ mod practical_tests {
         app.snapshot.attachment.as_mut().unwrap().status = AttachmentStatus::Ended;
         assert_eq!(app.scope_label(), "PID UNSEEN");
         assert_eq!(app.attachment_notice(), Some("Root no longer observed"));
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    fn demo() -> App {
+        App::new(DemoSampler::new().sample(false))
+    }
+
+    #[test]
+    fn screen_navigation_wraps_and_keeps_the_requested_direction() {
+        let mut app = demo();
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(View::ALL.map(View::index), [0, 1, 2, 3]);
+        assert!(app.navigation_key(KeyCode::Left));
+        assert_eq!(app.view, View::Changes);
+        assert_eq!(app.transition.unwrap().direction, -1);
+        assert!(app.show_changes);
+        assert!(app.navigation_key(KeyCode::Right));
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.transition.unwrap().direction, 1);
+        assert!(!app.show_changes);
+        for (digit, view) in ('1'..='4').zip(View::ALL) {
+            assert!(app.navigation_key(KeyCode::Char(digit)));
+            assert_eq!(app.view, view);
+        }
+        assert!(app.navigation_key(KeyCode::Char(']')));
+        assert_eq!(app.view, View::Overview);
+        assert!(app.navigation_key(KeyCode::Char('[')));
+        assert_eq!(app.view, View::Changes);
+        app.navigate_view(i32::MAX);
+        assert_eq!(app.view, View::History);
+        app.navigate_view(i32::MIN);
+        assert_eq!(app.view, View::History);
+    }
+
+    #[test]
+    fn switching_screens_preserves_session_work_and_explorer_state() {
+        let mut app = demo();
+        app.query = "codex".into();
+        app.reconcile_selection();
+        let selected = app.selected.unwrap();
+        app.toggle_pin();
+        app.start_rename();
+        app.rename_text = "codex project 3".into();
+        app.rename_key(KeyCode::Enter);
+        app.navigation_key(KeyCode::Enter);
+        app.tree_action(KeyCode::Char('C'));
+        let rows = app.explorer.visible_rows(app.selected_session().unwrap());
+        let process = app.explorer.selected();
+        app.paused = true;
+        app.sort = Sort::Growth;
+        let sample_tick = app.sample_tick;
+        for view in [
+            View::History,
+            View::Changes,
+            View::Overview,
+            View::ProcessMap,
+        ] {
+            app.set_view(view);
+            assert_eq!(app.selected, Some(selected));
+            assert_eq!(app.explorer.selected(), process);
+            assert_eq!(
+                app.explorer.visible_rows(app.selected_session().unwrap()),
+                rows
+            );
+            assert_eq!(app.query, "codex");
+            assert_eq!(app.nicknames[&selected], "codex project 3");
+            assert!(app.pins.contains(&selected));
+            assert!(app.paused);
+            assert_eq!(app.sort, Sort::Growth);
+            assert_eq!(app.sample_tick, sample_tick);
+            assert!(app.focused);
+            assert_eq!(app.focus, Focus::Processes);
+        }
+        app.set_view(View::Overview);
+        app.navigation_key(KeyCode::Right);
+        assert_eq!(app.view, View::ProcessMap);
+    }
+
+    #[test]
+    fn text_editors_capture_shortcuts_and_block_mouse_tabs() {
+        let mut app = demo();
+        app.start_search();
+        for character in "1234[]gmi".chars() {
+            assert!(!app.navigation_key(KeyCode::Char(character)));
+            app.search_key(KeyCode::Char(character));
+        }
+        assert_eq!(app.query, "1234[]gmi");
+        assert_eq!(app.view, View::Overview);
+        app.click(ui::HitTarget::View(View::History));
+        assert_eq!(app.view, View::Overview);
+        app.search_key(KeyCode::Esc);
+        app.start_rename();
+        for character in "1234[]gmi".chars() {
+            assert!(!app.navigation_key(KeyCode::Char(character)));
+            app.rename_key(KeyCode::Char(character));
+        }
+        assert_eq!(app.rename_text, "1234gmi");
+        app.click(ui::HitTarget::View(View::ProcessMap));
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.graph_mode, GraphMode::Constellation);
+        assert_eq!(app.metric, Metric::Rss);
+    }
+
+    #[test]
+    fn guides_own_arrows_and_shortcuts_without_navigation() {
+        let mut app = demo();
+        for tour in [false, true] {
+            app.help = !tour;
+            app.tour = tour;
+            for key in [
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Char('2'),
+                KeyCode::Char(']'),
+                KeyCode::Enter,
+            ] {
+                assert!(!app.navigation_key(key));
+                assert_eq!(app.view, View::Overview);
+            }
+            app.click(ui::HitTarget::View(View::Changes));
+            assert_eq!(app.view, View::Overview);
+        }
+    }
+
+    #[test]
+    fn inspector_arrows_fold_but_brackets_and_digits_still_switch_views() {
+        let mut app = demo();
+        app.navigation_key(KeyCode::Enter);
+        assert_eq!(app.view, View::ProcessMap);
+        assert!(app.focused);
+        assert_eq!(app.focus, Focus::Processes);
+        let expanded = app
+            .explorer
+            .visible_rows(app.selected_session().unwrap())
+            .len();
+        assert!(expanded > 1);
+        app.navigation_key(KeyCode::Left);
+        assert_eq!(app.view, View::ProcessMap);
+        assert_eq!(
+            app.explorer
+                .visible_rows(app.selected_session().unwrap())
+                .len(),
+            1
+        );
+        app.navigation_key(KeyCode::Right);
+        assert_eq!(app.view, View::ProcessMap);
+        assert_eq!(
+            app.explorer
+                .visible_rows(app.selected_session().unwrap())
+                .len(),
+            expanded
+        );
+        app.navigation_key(KeyCode::Char(']'));
+        assert_eq!(app.view, View::History);
+        app.navigation_key(KeyCode::Char('2'));
+        assert_eq!(app.view, View::ProcessMap);
+        assert!(app.focused); // Returning to a screen restores its inspector choice.
+        app.navigation_key(KeyCode::Char('2'));
+        assert!(app.focused);
+        app.navigation_key(KeyCode::Char('i'));
+        assert!(!app.focused);
+        app.navigation_key(KeyCode::Right);
+        assert_eq!(app.view, View::History);
+    }
+
+    #[test]
+    fn graph_only_navigation_moves_sessions_not_hidden_processes() {
+        let mut app = demo();
+        app.navigation_key(KeyCode::Char('2'));
+        let initial = app.selected;
+        app.move_cursor(1);
+        assert_ne!(app.selected, initial);
+        app.navigation_key(KeyCode::Char('i'));
+        let selected = app.selected;
+        app.move_cursor(1);
+        assert_eq!(app.selected, selected);
+        assert_ne!(app.explorer.selected(), selected);
+        app.navigation_key(KeyCode::Char('i'));
+        assert!(!app.focused);
+        app.move_cursor(-1);
+        assert_eq!(app.selected, initial);
+    }
+
+    #[test]
+    fn changes_are_a_screen_and_close_to_overview() {
+        let mut app = demo();
+        app.open_changes();
+        assert_eq!(app.view, View::Changes);
+        app.changes_key(KeyCode::Esc);
+        assert_eq!(app.view, View::Overview);
+        assert!(!app.show_changes);
+        app.navigation_key(KeyCode::Char('4'));
+        assert!(app.show_changes);
+        app.changes_key(KeyCode::Char('e'));
+        assert_eq!(app.view, View::Overview);
+    }
+
+    #[test]
+    fn graph_and_metric_modes_persist_and_respect_view_and_editing_context() {
+        let mut app = demo();
+        assert!(!app.navigation_key(KeyCode::Char('g')));
+        assert!(!app.navigation_key(KeyCode::Char('m')));
+        app.set_view(View::ProcessMap);
+        app.navigation_key(KeyCode::Char('g'));
+        app.navigation_key(KeyCode::Char('m'));
+        assert_eq!(app.graph_mode, GraphMode::Heatmap);
+        assert_eq!(app.metric, Metric::Cpu);
+        app.set_view(View::History);
+        assert!(!app.navigation_key(KeyCode::Char('g')));
+        assert_eq!(app.graph_mode, GraphMode::Heatmap);
+        app.start_search();
+        assert!(!app.navigation_key(KeyCode::Char('m')));
+        assert_eq!(app.metric, Metric::Cpu);
+        app.search_key(KeyCode::Esc);
+        app.navigation_key(KeyCode::Char('m'));
+        assert_eq!(app.metric, Metric::Rss);
+        app.set_view(View::Overview);
+        app.set_view(View::Changes);
+        app.set_view(View::ProcessMap);
+        assert_eq!(app.graph_mode, GraphMode::Heatmap);
+        assert_eq!(app.metric, Metric::Rss);
+        app.navigation_key(KeyCode::Char('g'));
+        assert_eq!(app.graph_mode, GraphMode::Constellation);
+        assert!(!app.navigation_key(KeyCode::Char('m')));
+        assert_eq!(app.metric, Metric::Rss);
+    }
+
+    #[test]
+    fn heatmap_cursor_and_tab_switch_between_processes_and_families() {
+        let mut app = demo();
+        app.set_view(View::ProcessMap);
+        app.navigation_key(KeyCode::Char('g'));
+        assert_eq!(app.graph_mode, GraphMode::Heatmap);
+        assert!(!app.focused);
+        assert_eq!(app.focus, Focus::Processes);
+        let family = app.selected;
+        let first = app.heatmap_processes()[0].key;
+        app.click(ui::HitTarget::Process(first));
+        app.move_cursor(1);
+        assert_eq!(app.selected, family);
+        assert_ne!(app.explorer.selected(), Some(first));
+        app.move_cursor(-1);
+        assert_eq!(app.explorer.selected(), Some(first));
+        app.navigation_key(KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Sessions);
+        app.move_cursor(1);
+        assert_ne!(app.selected, family);
+        let next_family = app.selected;
+        app.navigation_key(KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Processes);
+        app.move_cursor(i32::MIN);
+        let first = app.explorer.selected();
+        app.move_cursor(1);
+        assert_eq!(app.selected, next_family);
+        assert_ne!(app.explorer.selected(), first);
+        app.navigation_key(KeyCode::Right);
+        assert_eq!(app.view, View::History); // Hidden inspector does not own arrows.
+    }
+
+    #[test]
+    fn graph_metric_and_inspector_toggles_retain_the_process_identity() {
+        let mut app = demo();
+        app.navigation_key(KeyCode::Enter);
+        app.move_cursor(1);
+        let process = app.explorer.selected();
+        let family = app.selected;
+        app.navigation_key(KeyCode::Char('g'));
+        assert!(!app.focused);
+        assert_eq!(app.focus, Focus::Processes);
+        assert_eq!(app.graph_mode, GraphMode::Heatmap);
+        for key in [KeyCode::Char('m'), KeyCode::Char('g'), KeyCode::Char('g')] {
+            app.navigation_key(key);
+            assert_eq!(app.explorer.selected(), process);
+            assert_eq!(app.selected, family);
+            assert!(!app.focused);
+        }
+        app.navigation_key(KeyCode::Char('i'));
+        assert!(app.focused);
+        app.navigation_key(KeyCode::Char('i'));
+        assert!(!app.focused);
+        assert_eq!(app.focus, Focus::Processes);
+        assert_eq!(app.explorer.selected(), process);
+        app.navigation_key(KeyCode::Char('g'));
+        assert_eq!(app.focus, Focus::Sessions);
+        assert_eq!(app.graph_mode, GraphMode::Constellation);
+        assert_eq!(app.explorer.selected(), process);
+    }
+
+    #[test]
+    fn heatmap_order_is_shared_and_unknown_cpu_is_not_zero() {
+        let mut app = demo();
+        let selected = app.selected.unwrap();
+        let session = app
+            .snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.key == selected)
+            .unwrap();
+        for (index, process) in session.processes.iter_mut().enumerate() {
+            process.rss_bytes = (1_u64 << 54) + index as u64;
+            process.cpu_percent = match index {
+                0 => None,
+                1 => Some(f32::NAN),
+                2 => Some(-3.0),
+                3 => Some(0.0),
+                _ => Some(25.0),
+            };
+        }
+        assert!(
+            app.heatmap_processes()
+                .windows(2)
+                .all(|pair| pair[0].rss_bytes >= pair[1].rss_bytes)
+        );
+        app.metric = Metric::Cpu;
+        let cpus = app.heatmap_processes();
+        assert!(cpus[0].cpu_percent.is_some_and(|value| value == 25.0));
+        assert!(cpus.windows(2).all(|pair| {
+            let known = |p: &ProcessSnapshot| {
+                p.cpu_percent
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(-1.0)
+            };
+            known(pair[0]) > known(pair[1])
+                || (known(pair[0]) == known(pair[1]) && pair[0].key.pid < pair[1].key.pid)
+        }));
+        assert_eq!(
+            cpus.iter()
+                .filter(|p| p.cpu_percent.is_some_and(|v| v.is_finite() && v >= 0.0))
+                .count(),
+            cpus.len() - 3
+        );
+    }
+
+    #[test]
+    fn heatmap_can_visit_and_click_every_process_despite_tree_folds() {
+        let mut app = demo();
+        app.set_view(View::ProcessMap);
+        app.tree_action(KeyCode::Char('C'));
+        assert_eq!(
+            app.explorer
+                .visible_rows(app.selected_session().unwrap())
+                .len(),
+            1
+        );
+        app.navigation_key(KeyCode::Char('g'));
+        let ordered: Vec<_> = app
+            .heatmap_processes()
+            .iter()
+            .map(|process| process.key)
+            .collect();
+        app.move_cursor(i32::MIN);
+        assert_eq!(app.explorer.selected(), ordered.first().copied());
+        for key in &ordered {
+            assert_eq!(app.explorer.selected(), Some(*key));
+            app.move_cursor(1);
+        }
+        assert_eq!(app.explorer.selected(), ordered.last().copied());
+        app.move_cursor(i32::MAX);
+        assert_eq!(app.explorer.selected(), ordered.last().copied());
+        app.tree_action(KeyCode::Char('C'));
+        for key in ordered {
+            app.click(ui::HitTarget::Process(key));
+            assert_eq!(app.explorer.selected(), Some(key));
+        }
+    }
+
+    #[test]
+    fn paused_stale_and_resuming_data_suppress_and_end_transitions() {
+        let mut app = demo();
+        for condition in 0..4 {
+            app.paused = false;
+            app.sampler_failed = false;
+            app.resuming = false;
+            app.last_sample = Instant::now();
+            app.set_view(View::Overview);
+            app.set_view(View::History);
+            assert!(app.transition_progress().is_some());
+            match condition {
+                0 => app.paused = true,
+                1 => app.last_sample = Instant::now() - Duration::from_secs(60),
+                2 => app.resuming = true,
+                _ => app.sampler_failed = true,
+            }
+            assert!(app.transition_progress().is_none());
+            assert!(app.finish_transition());
+            assert!(app.transition.is_none());
+            app.set_view(View::ProcessMap);
+            assert!(app.transition.is_none());
+            assert_eq!(app.view, View::ProcessMap);
+        }
+    }
+
+    #[test]
+    fn transitions_are_bounded_replaceable_and_reduced_motion_is_instant() {
+        let mut app = demo();
+        assert!(app.transition_progress().is_none());
+        app.set_view(View::History);
+        let transition = app.transition.unwrap();
+        assert_eq!(transition.from, View::Overview);
+        assert_eq!(transition.to, View::History);
+        assert!(
+            app.transition_progress()
+                .is_some_and(|progress| (0.0..1.0).contains(&progress))
+        );
+        app.transition.as_mut().unwrap().started = Instant::now() - Duration::from_millis(80);
+        let progress = app.transition_progress().unwrap();
+        assert!((0.5..1.0).contains(&progress));
+        app.set_view(View::Changes);
+        assert_eq!(app.transition.unwrap().from, View::History);
+        app.transition.as_mut().unwrap().started = Instant::now() - VIEW_TRANSITION_DURATION;
+        assert!(app.transition_progress().is_none());
+        assert!(app.finish_transition());
+        assert!(app.transition.is_none());
+        assert!(!app.finish_transition());
+        app.no_motion = true;
+        app.navigate_view(1);
+        assert_eq!(app.view, View::Overview);
+        assert!(app.transition.is_none());
+        app.no_motion = false;
+        app.navigate_view(1);
+        assert!(app.transition.is_some());
+        app.no_motion = true;
+        assert!(app.transition_progress().is_none());
+        assert!(app.finish_transition());
+        assert!(app.transition.is_none());
     }
 }

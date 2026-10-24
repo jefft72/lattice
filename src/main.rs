@@ -20,7 +20,7 @@ use std::{
     name = "lattice",
     version,
     about = "Your coding sessions, seen as constellations.",
-    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n  ./lattice --pid 12345  Watch an existing dev server or build family\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: j/k or arrows select · Enter inspect · r nickname · e changes · / search · * pin · s sort · Space pause · ? help · q quit\n\nRead-only. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
+    after_help = "Quickstart:\n  ./lattice --tour     Learn the controls with simulated sessions\n  ./lattice           Monitor your real coding sessions\n  ./lattice --all     Explore all your accessible process families\n  ./lattice --doctor  Check this machine without opening the UI\n  ./lattice --pid 12345  Watch an existing dev server or build family\n\nThe repo-local launcher uses your existing Rust 1.95+ toolchain. It never installs it.\nFor a global command: cargo install --path . --locked, then lattice.\n\nKeys: 1–4 or [ ] switch screens · ←/→ previous/next · j/k select · Enter inspect · i inspector · g graph · m RAM/CPU · r nickname · e changes · / search · * pin · s sort · Space pause · ? help · q quit\n\nRead-only. Session memory is summed RSS, not unique physical memory. Headroom is an\navailable-memory heuristic, not native macOS pressure. No crash prevention or telemetry."
 )]
 struct Args {
     /// Explore a deterministic simulation instead of live processes.
@@ -32,7 +32,7 @@ struct Args {
     /// Check platform, terminal, and sampling without a TTY or saved report.
     #[arg(long, conflicts_with_all = ["demo", "tour", "snapshot", "all"])]
     doctor: bool,
-    /// Keep the sample-arrival indicator static; all readings remain identical.
+    /// Disable screen transitions; sampling and readings remain identical.
     #[arg(long)]
     no_motion: bool,
     /// Include other process families owned by your OS user.
@@ -47,6 +47,15 @@ struct Args {
     /// Export the demo UI to SVG without opening a terminal (requires --demo).
     #[arg(long, requires = "demo", value_name = "FILE")]
     snapshot: Option<PathBuf>,
+    /// Choose the demo snapshot screen: overview, map, history, or changes.
+    #[arg(long, requires = "snapshot", value_enum, conflicts_with_all = ["inspect", "changes"])]
+    view: Option<app::View>,
+    /// Choose the graph for a process-map snapshot.
+    #[arg(long, requires = "snapshot", value_enum)]
+    graph: Option<app::GraphMode>,
+    /// Choose RAM (rss) or CPU for a process-map or history snapshot.
+    #[arg(long, requires = "snapshot", value_enum)]
+    metric: Option<app::Metric>,
     /// Open the demo snapshot in process-inspector view.
     #[arg(long, requires = "snapshot")]
     inspect: bool,
@@ -84,13 +93,28 @@ fn main() -> io::Result<()> {
             app.update(sampler.sample(args.all));
         }
         app.no_motion = args.no_motion;
+        if let Some(view) = args.view {
+            app.set_view(view);
+        }
         if args.inspect {
+            app.set_view(app::View::ProcessMap);
             app.focused = true;
             app.focus = app::Focus::Processes;
         }
         if args.changes {
             app.open_changes();
         }
+        if let Some(graph) = args.graph {
+            app.graph_mode = graph;
+            if graph == app::GraphMode::Heatmap {
+                app.focus = app::Focus::Processes;
+            }
+        }
+        if let Some(metric) = args.metric {
+            app.metric = metric;
+        }
+        // Exports capture the settled screen, never a time-dependent transition.
+        app.transition = None;
         ui::save_svg(&app, args.width, args.height, &path)?;
         println!("Saved deterministic demo to {}", path.display());
         return Ok(());

@@ -36,5 +36,7 @@ jobs:
         run: python3 tools/onboarding_smoke.py target/release/lattice
       - name: Practical workflow interactions
         run: python3 tools/practical_smoke.py target/release/lattice
+      - name: Navigation interactions
+        run: python3 tools/navigation_smoke.py target/release/lattice
       - name: Failure-path cleanup
         run: python3 tools/fault_smoke.py

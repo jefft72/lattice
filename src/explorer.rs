@@ -56,6 +56,23 @@ impl Explorer {
         }
     }
 
+    /// Select an exact process from a flat view, opening only its ancestors.
+    /// Unrelated folded branches and the target's own folded state are preserved.
+    pub fn reveal_key(&mut self, session: &SessionSnapshot, key: ProcessKey) {
+        let forest = Forest::new(session);
+        self.reconcile_with(session.key, &forest);
+        let Some(&index) = forest.by_key.get(&key) else {
+            return;
+        };
+        let mut ancestor = forest.parents[index];
+        while let Some(index) = ancestor {
+            self.collapsed.remove(&forest.keys[index]);
+            ancestor = forest.parents[index];
+        }
+        self.selected = Some(key);
+        self.reconcile_with(session.key, &forest);
+    }
+
     pub fn move_selection(&mut self, session: &SessionSnapshot, delta: i32) {
         let forest = Forest::new(session);
         self.reconcile_with(session.key, &forest);
@@ -413,6 +430,31 @@ mod tests {
     }
 
     #[test]
+    fn reveal_key_opens_only_ancestors_and_selects_exact_identity() {
+        let session = session();
+        let mut explorer = Explorer::default();
+        explorer.collapse_all(&session);
+        explorer.reveal_key(&session, key(21));
+        assert_eq!(explorer.selected(), Some(key(21)));
+        assert_eq!(pids(&explorer, &session), [10, 20, 21, 30]);
+        assert!(
+            !explorer
+                .visible_rows(&session)
+                .iter()
+                .find(|row| row.key == key(30))
+                .unwrap()
+                .expanded
+        );
+        explorer.collapse_all(&session);
+        explorer.reveal_key(&session, key(20));
+        assert_eq!(explorer.selected(), Some(key(20)));
+        assert_eq!(pids(&explorer, &session), [10, 20, 30]);
+        explorer.reveal_key(&session, key(999));
+        assert_eq!(explorer.selected(), Some(key(20)));
+        assert_eq!(pids(&explorer, &session), [10, 20, 30]);
+    }
+
+    #[test]
     fn selection_is_clamped_without_signed_overflow() {
         let session = session();
         let mut explorer = Explorer::default();
@@ -592,6 +634,9 @@ mod tests {
         explorer.collapse_all(&session);
         assert_eq!(explorer.selected(), Some(key(1)));
         assert_eq!(pids(&explorer, &session), [1]);
+        explorer.reveal_key(&session, key(16_000));
+        assert_eq!(explorer.selected(), Some(key(16_000)));
+        assert_eq!(explorer.visible_rows(&session).len(), 16_000);
         explorer.expand_all(&session);
         assert_eq!(explorer.visible_rows(&session).len(), 16_000);
     }

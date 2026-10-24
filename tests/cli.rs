@@ -145,3 +145,113 @@ fn changes_demo_export_contains_observed_events_without_live_access() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn snapshot_screen_and_graph_selectors_are_explicit_and_validated() {
+    for args in [
+        vec!["--view", "map"],
+        vec!["--graph", "heatmap"],
+        vec!["--metric", "cpu"],
+        vec!["--demo", "--snapshot", "unused.svg", "--view", "unknown"],
+        vec!["--demo", "--snapshot", "unused.svg", "--graph", "tree"],
+        vec!["--demo", "--snapshot", "unused.svg", "--metric", "disk"],
+        vec![
+            "--demo",
+            "--snapshot",
+            "unused.svg",
+            "--view",
+            "map",
+            "--inspect",
+        ],
+        vec![
+            "--demo",
+            "--snapshot",
+            "unused.svg",
+            "--view",
+            "changes",
+            "--changes",
+        ],
+    ] {
+        let output = binary().args(&args).output().unwrap();
+        assert!(!output.status.success(), "unexpected success for {args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+    }
+    let output = binary().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "--view",
+        "--graph",
+        "--metric",
+        "heatmap",
+        "Disable screen transitions",
+    ] {
+        assert!(help.contains(expected), "missing {expected} in {help}");
+    }
+    let version = binary().arg("--version").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        "lattice 0.3.0"
+    );
+}
+
+#[test]
+fn all_snapshot_screens_are_settled_repeatable_and_distinct() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("lattice-views-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let mut outputs = Vec::new();
+    for (index, options) in [
+        vec!["--view", "overview"],
+        vec!["--view", "map"],
+        vec!["--view", "history"],
+        vec!["--view", "changes"],
+        vec!["--inspect"],
+        vec!["--view", "map", "--graph", "heatmap", "--metric", "cpu"],
+        vec!["--view", "history", "--metric", "cpu"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = dir.join(format!("screen-{index}.svg"));
+        let mut run_outputs = Vec::new();
+        for _ in 0..2 {
+            let output = binary()
+                .args(["--demo", "--snapshot"])
+                .arg(&path)
+                .args(&options)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{options:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            run_outputs.push(fs::read_to_string(&path).unwrap());
+        }
+        assert_eq!(
+            run_outputs[0], run_outputs[1],
+            "snapshot not settled: {options:?}"
+        );
+        outputs.push(run_outputs.pop().unwrap());
+    }
+    for left in 0..outputs.len() {
+        for right in left + 1..outputs.len() {
+            assert_ne!(
+                outputs[left], outputs[right],
+                "screens {left} and {right} should differ"
+            );
+        }
+    }
+    let alias = dir.join("changes-alias.svg");
+    let result = binary()
+        .args(["--demo", "--changes", "--snapshot"])
+        .arg(&alias)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(fs::read_to_string(alias).unwrap(), outputs[3]);
+    fs::remove_dir_all(dir).unwrap();
+}
